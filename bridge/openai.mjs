@@ -37,10 +37,32 @@ export function openaiKey() {
  * reason shows up on screen instead of being swallowed.
  */
 let cachedModel = null
+/** The rest of the ranked list, so a rejected pick can fall through to it. */
+let ranked = []
+
+/**
+ * The API saying the MODEL is wrong, rather than the request.
+ *
+ * Worth separating. A bad request belongs on the user's screen; a model the
+ * catalogue advertised and the chat endpoint then refuses is ours to recover
+ * from, and without this the first bad pick is cached and every later turn
+ * re-posts the same dead id until the bridge is restarted.
+ */
+function wrongModel(status, message) {
+  if (status === 404) return true
+  if (status !== 400) return false
+  return /not a chat model|only supported in v1\/responses|model_not_found|does not exist|do not have access to (the )?model/i.test(
+    message,
+  )
+}
 
 export async function resolveModel(signal) {
   if (process.env.OPENAI_MODEL?.trim()) return process.env.OPENAI_MODEL.trim()
   if (cachedModel) return cachedModel
+  if (ranked.length) {
+    cachedModel = ranked[0]
+    return cachedModel
+  }
 
   const key = openaiKey()
   if (!key) throw new Error('no OPENAI_API_KEY')
@@ -54,23 +76,38 @@ export async function resolveModel(signal) {
   }
   const { data = [] } = await res.json()
 
-  // Chat models only: the embeddings, audio, image and moderation entries in
-  // this list would all 400 on /chat/completions.
+  // Chat models only. The embeddings, audio, image and moderation entries
+  // would all 400 here -- and so would two subtler families the first version
+  // of this filter let straight through: `-instruct` is completions-only, and
+  // the `-pro` models answer on /v1/responses and nowhere else.
   const chat = data
     .map((m) => m.id)
     .filter((id) => /^(gpt|o\d)/.test(id))
-    .filter((id) => !/(embed|whisper|tts|dall-e|moderation|audio|realtime|image|transcribe|search|codex)/.test(id))
+    .filter(
+      (id) =>
+        !/(embed|whisper|tts|dall-e|moderation|audio|realtime|image|transcribe|search|codex|instruct)/.test(
+          id,
+        ),
+    )
+    .filter((id) => !/(^|-)pro(-|$)/.test(id))
 
   if (!chat.length) throw new Error('this key exposes no chat models')
 
-  // Prefer the highest generation number, then the most recently dated build,
-  // then the shortest id — which is how OpenAI names its stable aliases
-  // ("gpt-5" over "gpt-5-2025-11-01-preview").
+  // Highest generation first (5.1 beats 5), then a stable build over a
+  // preview, then an undated alias over a dated snapshot.
+  //
+  // That third term is the one that matters and the one the first version got
+  // wrong. It ranked by date before length, so a dated snapshot always beat
+  // the bare alias and the "shortest id wins" rule it documented could never
+  // run. The cost is not cosmetic: snapshots are retired on a published
+  // schedule, so the bridge would have broken on a date nobody had in their
+  // calendar, while the alias tracks the current build indefinitely.
   const rank = (id) => {
-    const gen = Number(id.match(/^(?:gpt|o)-?(\d+)/)?.[1] ?? 0)
+    const gen = Number(id.match(/^(?:gpt|o)-?(\d+(?:\.\d+)?)/)?.[1] ?? 0)
     const date = Number(id.match(/(\d{4})-?(\d{2})-?(\d{2})/)?.slice(1).join('') ?? 0)
     const preview = /preview|alpha|beta/.test(id) ? -1 : 0
-    return [gen, preview, date, -id.length]
+    const snapshot = date ? -1 : 0
+    return [gen, preview, snapshot, -id.length, date]
   }
   chat.sort((a, b) => {
     const ra = rank(a)
@@ -79,7 +116,8 @@ export async function resolveModel(signal) {
     return 0
   })
 
-  cachedModel = chat[0]
+  ranked = chat
+  cachedModel = ranked[0]
   return cachedModel
 }
 
@@ -94,7 +132,7 @@ export async function resolveModel(signal) {
  * interface to do, so an AbortError resolves with whatever was said so far
  * rather than throwing into the caller's error path.
  */
-export async function streamChat({ messages, signal, onDelta }) {
+export async function streamChat({ messages, signal, onDelta, retried = false }) {
   const key = openaiKey()
   if (!key) throw new Error('no OPENAI_API_KEY')
 
@@ -121,7 +159,30 @@ export async function streamChat({ messages, signal, onDelta }) {
     } catch {
       /* not json; the raw body is the best we have */
     }
-    throw new Error(`OpenAI ${res.status}: ${message || 'no detail'}`)
+    // A model the catalogue advertised and this endpoint refuses is a bad
+    // guess on our side, not a bad question on theirs. Drop it and take the
+    // runner-up the ranking already computed. Only once, and only when we
+    // chose the model: a pinned OPENAI_MODEL is the user's decision and gets
+    // reported rather than second-guessed.
+    const auto = !process.env.OPENAI_MODEL?.trim()
+    if (
+      auto &&
+      !retried &&
+      !signal?.aborted &&
+      ranked.length > 1 &&
+      wrongModel(res.status, message)
+    ) {
+      console.warn(
+        `[jarvis] ${ranked[0]} was refused by the chat endpoint; falling back to ${ranked[1]}`,
+      )
+      ranked.shift()
+      cachedModel = null
+      return streamChat({ messages, signal, onDelta, retried: true })
+    }
+
+    // Name the model. "OpenAI 400" alone leaves the user guessing at which of
+    // the key, the account and the model is the one at fault.
+    throw new Error(`OpenAI ${res.status} (${model}): ${message || 'no detail'}`)
   }
 
   let full = ''

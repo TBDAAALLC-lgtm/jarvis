@@ -504,9 +504,13 @@ export function createSpeaker(): Speaker {
       // Chest-weighted, which the previous character explicitly was not.
       // The old note here warned that going lower reads as a film-trailer
       // voiceover — true, and for Morpheus that is nearer right than wrong.
-      // 0.78 is as far as it goes before the formants smear and consonants
-      // start dropping out, which costs more than the depth is worth.
-      u.pitch = 0.78
+      // 0.70 by ear, on request. This note used to claim 0.78 was the floor
+      // before formants smear and consonants start dropping out — written
+      // from reading rather than listening, and wrong on this machine.
+      // Microsoft David carries 0.70. It does soften plosives, so if words
+      // start arriving mushy rather than deep, this line is the cause and
+      // not the voice.
+      u.pitch = 0.7
 
       // speechSynthesis exposes no amplitude, so drive the reactor from a
       // synthetic envelope. It only has to look like speech, not match it.
