@@ -17,21 +17,45 @@ import { BACKEND, BRIDGE_HTTP_URL, env } from '../config'
  * is not a path worth encouraging, so direct mode is treated as browser-only.
  */
 
+/** Whether one brain can answer, and a short reason when it cannot. */
+export type ProviderState = { ready: boolean; detail: string }
+
+export type ProviderName = 'claude' | 'gpt'
+
 export type Capabilities = {
   /** ElevenLabs speech-to-text (Scribe) is reachable via the bridge. */
   stt: boolean
   /** ElevenLabs text-to-speech is reachable via the bridge. */
   tts: boolean
+  /**
+   * Which brains can actually answer right now.
+   *
+   * Worth probing rather than discovering by asking: an expired Claude
+   * login and a missing OpenAI key both produce a turn that says nothing,
+   * and silence is the one symptom this interface cannot explain. Knowing
+   * up front lets the tile say so before the user talks to a dead brain.
+   */
+  providers: Record<ProviderName, ProviderState>
 }
 
 /** Browser-only until the probe says otherwise. Safe default: the app works. */
-let current: Capabilities = { stt: false, tts: false }
+const UNKNOWN: Record<ProviderName, ProviderState> = {
+  claude: { ready: false, detail: 'bridge not reached' },
+  gpt: { ready: false, detail: 'bridge not reached' },
+}
+
+let current: Capabilities = { stt: false, tts: false, providers: UNKNOWN }
 let probed = false
 
 /** The last known capabilities. Read synchronously by the voice and speech
  *  layers; accurate once `probeCapabilities` has resolved during boot. */
 export function caps(): Capabilities {
   return current
+}
+
+/** What each brain reported at boot. */
+export function providers(): Record<ProviderName, ProviderState> {
+  return current.providers
 }
 
 export function capabilitiesProbed(): boolean {
@@ -47,7 +71,14 @@ export function capabilitiesProbed(): boolean {
 export async function probeCapabilities(): Promise<Capabilities> {
   if (BACKEND !== 'bridge') {
     // No bridge to ask. Direct mode has no server-side speech, so browser only.
-    current = { stt: false, tts: false }
+    current = {
+      stt: false,
+      tts: false,
+      providers: {
+        claude: { ready: true, detail: 'direct API' },
+        gpt: { ready: false, detail: 'bridge only' },
+      },
+    }
     probed = true
     return current
   }
@@ -56,8 +87,28 @@ export async function probeCapabilities(): Promise<Capabilities> {
       signal: AbortSignal.timeout(3000),
     })
     if (res.ok) {
-      const h = (await res.json()) as { stt?: boolean; tts?: boolean }
-      current = { stt: Boolean(h.stt), tts: Boolean(h.tts) }
+      const h = (await res.json()) as {
+        stt?: boolean
+        tts?: boolean
+        providers?: Partial<Record<ProviderName, Partial<ProviderState>>>
+      }
+      const one = (name: ProviderName): ProviderState => ({
+        ready: Boolean(h.providers?.[name]?.ready),
+        detail: h.providers?.[name]?.detail ?? 'unknown',
+      })
+      current = {
+        stt: Boolean(h.stt),
+        tts: Boolean(h.tts),
+        // An older bridge sends no `providers` block at all. Claiming both
+        // are dead would be wrong, so fall back to the pre-tile world:
+        // Claude answers, GPT was never wired up.
+        providers: h.providers
+          ? { claude: one('claude'), gpt: one('gpt') }
+          : {
+              claude: { ready: true, detail: 'bridge (no status)' },
+              gpt: { ready: false, detail: 'bridge too old' },
+            },
+      }
     }
   } catch {
     // Bridge down or slow — stay on the browser engines rather than blocking

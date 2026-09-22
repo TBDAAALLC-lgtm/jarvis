@@ -240,8 +240,16 @@ type State = {
   expandedBlade: string | null
   /** JARVIS's control over his own appearance. UI_DEFAULTS == the stock look. */
   ui: UiState
+  /**
+   * Which brain answers. Deliberately NOT inside `ui`: that object is what
+   * the model itself may repaint, and `ui_reset` wipes it back to defaults.
+   * Letting a spoken "reset the interface" silently switch brains mid-
+   * conversation would be a genuinely baffling thing to live with.
+   */
+  provider: Provider
 
   setVoice: (v: string) => void
+  setProvider: (p: Provider) => void
   setGestures: (on: boolean) => void
   setLooking: (why: string | null) => void
   setBootNote: (n: string) => void
@@ -270,6 +278,25 @@ type State = {
   clearScreen: (what: 'all' | 'panels' | 'transcript') => void
 }
 
+/** The two brains the corner tiles switch between. */
+export type Provider = 'claude' | 'gpt'
+
+const PROVIDER_KEY = 'morpheus.provider'
+
+/**
+ * Remembered across reloads, because a voice interface is used in short
+ * bursts and re-picking your brain every time you open the tab is friction
+ * with no upside. Guarded: storage throws in a private window, and the app
+ * working matters more than the preference surviving.
+ */
+function savedProvider(): Provider {
+  try {
+    return localStorage.getItem(PROVIDER_KEY) === 'gpt' ? 'gpt' : 'claude'
+  } catch {
+    return 'claude'
+  }
+}
+
 export const useStore = create<State>((set) => ({
   phase: 'offline',
   level: 0,
@@ -287,8 +314,17 @@ export const useStore = create<State>((set) => ({
   expandedBlade: null,
   bootNote: '',
   ui: defaultUi(),
+  provider: savedProvider(),
 
   setVoice: (voice) => set({ voice }),
+  setProvider: (provider) => {
+    try {
+      localStorage.setItem(PROVIDER_KEY, provider)
+    } catch {
+      /* private window; the choice still holds for this session */
+    }
+    set({ provider })
+  },
   setGestures: (gestures) => set({ gestures }),
   setLooking: (looking) => set({ looking }),
   setBootNote: (bootNote) => set({ bootNote }),

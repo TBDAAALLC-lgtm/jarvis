@@ -27,6 +27,7 @@ import { readFile, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
 import { probeUrl, renderPage } from './page.mjs'
+import { openaiKey, streamChat } from './openai.mjs'
 
 const PORT = Number(process.env.JARVIS_BRIDGE_PORT ?? 8787)
 
@@ -298,7 +299,7 @@ function decideTool(name) {
   return ALLOW_WRITES
 }
 
-const SYSTEM_PROMPT = `You are JARVIS. You are speaking out loud to one person.
+const SYSTEM_PROMPT = `You are MORPHEUS. You are speaking out loud to one person.
 
 LENGTH. Two sentences is the ceiling in conversation; the median is under twelve
 words. Every word is read aloud and the user waits in silence while it plays, so
@@ -453,6 +454,44 @@ Using tools:
  * machine — no reason to make you paste it into a second .env file. The browser
  * never sees it: it POSTs text to /tts here and gets audio back.
  */
+/**
+ * Whether the Claude side can actually answer, and if it can't, why.
+ *
+ * The SDK reports an expired login the same way it reports a finished
+ * answer: as a normal turn result whose text happens to read "Failed to
+ * authenticate". Nothing ever speaks a result, so the failure was silent —
+ * the interface looked alive and simply never replied. Reading the token
+ * state directly lets the screen say so before a word is spoken.
+ *
+ * Only the REFRESH token expiring is fatal. The access token expires
+ * constantly and is renewed behind the scenes; treating that as broken
+ * would report an outage several times a day that nobody is having.
+ */
+/** What a dead login looks like when the SDK hands it back as an answer. */
+const AUTH_FAILURE =
+  /failed to authenticate|oauth (?:session|token) expired|invalid api key|please run .?claude (?:auth )?login/i
+
+function claudeAuth() {
+  if (process.env.ANTHROPIC_API_KEY) return { ok: true, detail: 'API key' }
+  try {
+    const raw = readFileSync(
+      join(homedir(), '.claude', '.credentials.json'),
+      'utf8',
+    )
+    const oauth = JSON.parse(raw).claudeAiOauth ?? {}
+    const refresh = Number(oauth.refreshTokenExpiresAt ?? 0)
+    if (!refresh) {
+      return { ok: false, detail: 'not signed in - run: claude auth login' }
+    }
+    if (refresh < Date.now()) {
+      return { ok: false, detail: 'login expired - run: claude auth login' }
+    }
+    return { ok: true, detail: oauth.subscriptionType ?? 'subscription' }
+  } catch {
+    return { ok: false, detail: 'no login found - run: claude auth login' }
+  }
+}
+
 function elevenKey() {
   if (process.env.ELEVENLABS_API_KEY) return process.env.ELEVENLABS_API_KEY
   try {
@@ -691,8 +730,26 @@ const handleRequest = async (req, res) => {
     // without one it falls back to the browser's own recogniser and voice, so a
     // student with nothing configured still has a working assistant.
     const eleven = Boolean(elevenKey())
+    const anthropic = claudeAuth()
+    const gptKey = Boolean(openaiKey())
     res.writeHead(200, { ...cors, 'content-type': 'application/json' })
-    return res.end(JSON.stringify({ ok: true, tts: eleven, stt: eleven }))
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        tts: eleven,
+        stt: eleven,
+        // Per-brain readiness, so the two tiles in the corner can each
+        // show their own state instead of the app inferring it from
+        // silence — which is exactly what nobody could do before.
+        providers: {
+          claude: { ready: anthropic.ok, detail: anthropic.detail },
+          gpt: {
+            ready: gptKey,
+            detail: gptKey ? 'API key' : 'no OPENAI_API_KEY set',
+          },
+        },
+      }),
+    )
   }
 
   // Serve local image files to the page. Screenshots and generated art land on
@@ -1351,9 +1408,27 @@ wss.on('connection', (socket) => {
             // nothing to say — the HUD stops spinning and JARVIS stands there
             // silent. Say what happened instead.
             if (msg.subtype === 'success') {
+              // A dead login comes back as a *successful* turn whose whole
+              // text is the refusal. Spoken text only ever comes from
+              // stream deltas and a refusal produces none, so this landed
+              // as silence with no error anywhere on screen. Catch the
+              // shape and raise it as the failure it actually is.
+              const body = msg.result ?? ''
+              if (AUTH_FAILURE.test(body)) {
+                console.error(
+                  '[jarvis] auth failure arrived as a result:',
+                  body,
+                )
+                sendTurn({ type: 'error', message: body })
+                finishTurn?.()
+                finishTurn = null
+                seenTools.clear()
+                heldTools.clear()
+                break
+              }
               sendTurn({
                 type: 'done',
-                text: msg.result ?? '',
+                text: body,
                 costUsd: msg.total_cost_usd ?? null,
               })
             } else {
@@ -1403,6 +1478,56 @@ wss.on('connection', (socket) => {
     }
   })()
 
+  /**
+   * GPT keeps its own history.
+   *
+   * The SDK owns Claude's transcript inside the session and nothing out
+   * here can read it, so the two tiles are two conversations. Handing one
+   * brain the other's memory would be a lie about who said what, and
+   * switching tiles mid-thought would silently rewrite the past.
+   *
+   * Capped because a voice session has no natural end and every turn
+   * resends the whole transcript: unbounded, the price of one question
+   * grows with how long the window has been open.
+   */
+  const gptHistory = []
+  const GPT_HISTORY_TURNS = 24
+  let gptAbort = null
+
+  async function answerWithGpt(text, id) {
+    answering = id
+    gptHistory.push({ role: 'user', content: text })
+    while (gptHistory.length > GPT_HISTORY_TURNS * 2) gptHistory.shift()
+
+    gptAbort = new AbortController()
+    try {
+      const { text: full, aborted } = await streamChat({
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          ...gptHistory,
+        ],
+        signal: gptAbort.signal,
+        onDelta: (delta) => sendTurn({ type: 'text', delta }),
+      })
+      if (full) gptHistory.push({ role: 'assistant', content: full })
+      if (!aborted) sendTurn({ type: 'done', text: full, costUsd: null })
+    } catch (err) {
+      // Straight to the screen as an error frame, never as answer text.
+      // A failure dressed as an answer is the bug that made this whole
+      // app look mute, and it is not being reproduced here.
+      const message = String(err?.message ?? err)
+      console.error('[jarvis] gpt turn failed:', message)
+      sendTurn({ type: 'error', message })
+    } finally {
+      gptAbort = null
+      // The interrupt handshake waits on this. An OpenAI turn produces no
+      // SDK 'result' message, so nothing else would ever release it and
+      // the next question would sit behind the settle cap for nothing.
+      finishTurn?.()
+      finishTurn = null
+    }
+  }
+
   socket.on('message', (raw) => {
     let msg
     try {
@@ -1427,7 +1552,12 @@ wss.on('connection', (socket) => {
        */
       const text = msg.text
       const id = typeof msg.id === 'string' ? msg.id : null
+      const provider = msg.provider === 'gpt' ? 'gpt' : 'claude'
       void settling.then(() => {
+        if (provider === 'gpt') {
+          void answerWithGpt(text, id)
+          return
+        }
         answering = id
         if (deliver) {
           const resolve = deliver
@@ -1451,6 +1581,9 @@ wss.on('connection', (socket) => {
     if (msg.type === 'interrupt') {
       // Held so the next question can wait for it rather than racing it.
       const stopped = turnFinished()
+      // Whichever one is talking. Aborting an idle provider is a no-op,
+      // so there is nothing to track about who spoke last.
+      gptAbort?.abort()
       settling = Promise.resolve(session.interrupt?.())
         .catch(() => {})
         .then(() =>

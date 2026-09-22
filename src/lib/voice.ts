@@ -78,7 +78,7 @@ const WAKE_DEBOUNCE = 1500
  * indication why. Better a rare false wake than a name that does not answer.
  */
 const WAKE =
-  /\b(?:hey|hi|ok|okay|yo)?\s*(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv)\b(?!'s)/i
+  /\b(?:hey|hi|ok|okay|yo)?\s*(?:morpheus|morpheous|morphius|morpheus's|morphus|morfeus|orpheus|morph)\b(?!'s)/i
 
 /** Everything after the wake phrase, which is usually the actual command. */
 function afterWake(text: string): string {
@@ -267,7 +267,7 @@ const norm = (s: string) =>
  * would be the single most infuriating failure this file could have.
  */
 const OVERRIDE =
-  /\b(stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it|no)\b/i
+  /\b(stop|wait|morpheus|cancel|enough|quiet|hold on|shut up|never ?mind|forget it|no)\b/i
 
 /**
  * Words too common to be evidence of anything.

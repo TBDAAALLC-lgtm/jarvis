@@ -63,7 +63,8 @@ const newId = () =>
 
 /** The same mishearings voice.ts accepts for the wake word — otherwise a turn
  *  that woke him as "travis" gets that word sent on to the model as a question. */
-const NAME = '(?:jarvis|jarvys|jervis|travis|jarviss|java\'s|jarv)'
+const NAME =
+  '(?:morpheus|morpheous|morphius|morpheus\'s|morphus|morfeus|orpheus|morph)'
 /** A bare vocative — "Jarvis", "hey jarvis" — with nothing asked. */
 const BARE_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}[\\s,.!?]*$`, 'i')
 /** A leading vocative on a real command: "Jarvis, what's the weather". */
@@ -147,40 +148,48 @@ export default function App() {
     let filled = false
 
     try {
-      const { text } = await ask(said, history.current, {
-        onText: (delta) => {
-          if (stale()) return
-          if (!started) {
-            started = true
-            store.getState().setPhase('speaking')
-            // The answer arriving is what ends the tool phase — a timer would
-            // clear the readout while a slow tool was still running.
-            store.getState().setActiveTool(null)
-            music.working(false)
-            store.getState().pushTurn({ id: turnId, role: 'jarvis', text: '' })
-          }
-          store.getState().appendToLastTurn(delta)
-          spk.push(delta)
+      const { text } = await ask(
+        said,
+        history.current,
+        {
+          onText: (delta) => {
+            if (stale()) return
+            if (!started) {
+              started = true
+              store.getState().setPhase('speaking')
+              // The answer arriving is what ends the tool phase — a timer would
+              // clear the readout while a slow tool was still running.
+              store.getState().setActiveTool(null)
+              music.working(false)
+              store.getState().pushTurn({ id: turnId, role: 'jarvis', text: '' })
+            }
+            store.getState().appendToLastTurn(delta)
+            spk.push(delta)
+          },
+          onTool: (name) => {
+            if (stale()) return
+            // Only claim the tooling phase while he has nothing to say yet.
+            // Setting it unconditionally pinned the machine in 'tooling' for the
+            // rest of any answer that called a tool after it started talking,
+            // which also broke the reactor's lip-sync for the remainder.
+            if (!started) store.getState().setPhase('tooling')
+            store.getState().setActiveTool(name)
+            sfx.play('tool')
+            music.working(true)
+            // Say something the moment work starts — a tool can take ten seconds
+            // and silence that long reads as a crash. Once per turn only; a
+            // chain of five tools shouldn't produce five apologies.
+            if (!filled && !started) {
+              filled = true
+              spk.say(forTool(name))
+            }
+          },
         },
-        onTool: (name) => {
-          if (stale()) return
-          // Only claim the tooling phase while he has nothing to say yet.
-          // Setting it unconditionally pinned the machine in 'tooling' for the
-          // rest of any answer that called a tool after it started talking,
-          // which also broke the reactor's lip-sync for the remainder.
-          if (!started) store.getState().setPhase('tooling')
-          store.getState().setActiveTool(name)
-          sfx.play('tool')
-          music.working(true)
-          // Say something the moment work starts — a tool can take ten seconds
-          // and silence that long reads as a crash. Once per turn only; a
-          // chain of five tools shouldn't produce five apologies.
-          if (!filled && !started) {
-            filled = true
-            spk.say(forTool(name))
-          }
-        },
-      })
+        // Read at send time, not at mount: the tiles can be clicked
+        // between turns and the next question should go where the lit
+        // tile says it will.
+        store.getState().provider,
+      )
 
       if (stale()) return
 
@@ -578,7 +587,10 @@ export default function App() {
 
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return
+      // BUTTON included because Space activates a focused button. Without
+      // it, clicking a brain tile then pressing Space both re-fires the
+      // tile and opens the microphone.
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON') return
 
       // V auditions the next British voice installed on this machine. Which
       // ones exist varies per Mac, so hearing them beats trusting a ranking.

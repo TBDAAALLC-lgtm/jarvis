@@ -1896,3 +1896,113 @@ kbd {
   transform: scaleX(-1);
   background: #000;
 }
+
+/* ------------------------------------------------------- brain tiles */
+/*
+ * The two brains, top right, under the status line.
+ *
+ * Colour is pinned to --accent via color-mix so these retint with the rest
+ * of the interface when the model repaints it — a hardcoded cyan would be
+ * the one element that ignored `ui_theme`. The unavailable state is the
+ * exception: it is red regardless of accent, because "this brain cannot
+ * answer" has to survive being themed.
+ */
+.brains {
+  position: absolute;
+  top: 78px;
+  right: 92px;
+  display: flex;
+  gap: 6px;
+  /* .hud is pointer-events: none so the canvas stays draggable through it. */
+  pointer-events: auto;
+}
+
+.brain {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  background: color-mix(in srgb, var(--accent) 5%, rgba(2, 8, 12, 0.72));
+  backdrop-filter: blur(8px);
+  color: color-mix(in srgb, var(--accent) 66%, white);
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease;
+}
+
+.brain:hover {
+  border-color: color-mix(in srgb, var(--accent) 44%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, rgba(2, 8, 12, 0.72));
+}
+
+.brain:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: 2px;
+}
+
+/* The selected brain. */
+.brain-on {
+  border-color: color-mix(in srgb, var(--accent) 62%, transparent);
+  background: color-mix(in srgb, var(--accent) 16%, rgba(2, 8, 12, 0.8));
+  color: color-mix(in srgb, var(--accent) 92%, white);
+}
+
+.brain-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+  flex: none;
+}
+
+.brain-on .brain-dot {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+}
+
+.brain-name {
+  font-weight: 500;
+}
+
+/* The verdict. Dimmer than the name: it is the answer to a question you
+   only ask when something is wrong. */
+.brain-state {
+  opacity: 0.55;
+  font-size: 8px;
+}
+
+/* Cannot answer. Still clickable — see the note in Brains.tsx. */
+.brain-down {
+  border-color: rgba(255, 107, 107, 0.3);
+  color: rgba(255, 150, 150, 0.85);
+}
+
+.brain-down .brain-dot {
+  background: #ff6b6b;
+  box-shadow: none;
+}
+
+.brain-down .brain-state {
+  opacity: 0.9;
+  color: #ff8b8b;
+}
+
+.brain-on.brain-down {
+  border-color: rgba(255, 107, 107, 0.62);
+  background: rgba(255, 107, 107, 0.12);
+}
+
+@media (max-width: 900px) {
+  /* Matches the gutter .hud-top and .rail-right drop to at this width. */
+  .brains {
+    right: 30px;
+  }
+}

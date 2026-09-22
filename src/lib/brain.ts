@@ -28,9 +28,18 @@ export async function ask(
   prompt: string,
   history: Msg[],
   handlers: AskHandlers,
+  provider: 'claude' | 'gpt' = 'claude',
 ): Promise<{ text: string; tools: string[] }> {
+  // Direct mode talks to the Anthropic API from the browser; there is no
+  // second endpoint behind it and no key for one. Saying so beats letting
+  // the question go to Claude while the tile still reads GPT.
+  if (!usingBridge && provider === 'gpt') {
+    throw new Error(
+      'Morpheus-GPT needs the bridge — direct mode talks only to Claude.',
+    )
+  }
   return usingBridge
-    ? bridge.ask(prompt, handlers)
+    ? bridge.ask(prompt, handlers, provider)
     : direct.ask([...history, { role: 'user', content: prompt }], handlers)
 }
 

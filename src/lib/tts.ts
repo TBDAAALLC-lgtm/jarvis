@@ -162,37 +162,54 @@ const MAX_UNSPOKEN = 220
 // Voice selection
 // ---------------------------------------------------------------------------
 
-const VOICE_PREF_KEY = 'jarvis.voice'
+const VOICE_PREF_KEY = 'morpheus.voice'
 
 /**
- * Rank installed voices by how close they are to the character: a British
- * male, low and level, not a novelty voice.
+ * Rank installed voices by how close they are to the character: a deep,
+ * level male voice, not a novelty one.
  *
- * The big win on macOS is the Enhanced/Premium variant of Daniel. The stock
- * "Daniel" is a compact voice from a decade ago and sounds it; the Enhanced
- * download is free (System Settings → Accessibility → Spoken Content → System
- * Voice → Manage Voices) and once installed it appears here automatically.
+ * Reweighted for Morpheus, who is American and speaks from the chest. The
+ * previous ranking was built for a British butler and scored en-GB above
+ * everything, which on Windows was actively wrong: Microsoft David and
+ * Microsoft Guy — the two deep male voices almost every Windows machine
+ * actually has — matched no name rule at all, scored 5 against a threshold
+ * of 40, and were dropped from the candidate list entirely. The picker then
+ * fell through to its last resort and chose Microsoft Zira, who is female.
+ * So the voice nobody wanted was the only one a stock Windows box could get.
+ *
+ * macOS keeps its Enhanced/Premium downloads worth having: the stock voices
+ * are a decade old and sound it, and the better variants appear here
+ * automatically once installed (System Settings → Accessibility → Spoken
+ * Content → System Voice → Manage Voices).
  */
 function score(v: SpeechSynthesisVoice): number {
   const n = v.name.toLowerCase()
   let s = 0
 
-  // The macOS British male, and the closest thing to the character available
-  // without leaving the machine.
-  if (n.startsWith('daniel')) s += 100
-  else if (n.includes('google uk english male')) s += 85
-  else if (/\b(oliver|arthur|jamie|malcolm)\b/.test(n)) s += 80
-  // Newer macOS en-GB male voices — casual, but serviceable.
+  // Windows first, because that is where the deep male voices are and
+  // where they were previously unreachable. David is the darkest of them.
+  if (n.includes('david')) s += 105
+  else if (n.includes('guy')) s += 95
+  else if (/\b(mark|christopher|eric|roger|steffan|brandon)\b/.test(n)) s += 75
+  // macOS, and the Google network voices.
+  else if (n.startsWith('daniel')) s += 90
+  else if (n.includes('google us english')) s += 80
+  else if (n.includes('google uk english male')) s += 78
+  else if (/\b(oliver|arthur|jamie|malcolm|ryan|george|thomas|alex|fred)\b/.test(n)) s += 70
+  // Casual, but serviceable.
   else if (/\b(reed|rocko|eddy)\b/.test(n)) s += 40
 
   // Higher-quality variants of whatever matched above.
   if (n.includes('premium')) s += 30
   else if (n.includes('enhanced')) s += 20
 
-  if (/en[-_]gb/i.test(v.lang)) s += 25
+  // American now leads, to match the character. en-GB stays well above the
+  // other English locales so a British machine still lands somewhere good.
+  if (/en[-_]us/i.test(v.lang)) s += 25
+  else if (/en[-_]gb/i.test(v.lang)) s += 18
   else if (/^en/i.test(v.lang)) s += 5
 
-  // Voices that clearly aren't a butler.
+  // Voices that clearly are not the character.
   if (/grandma|grandpa|bubbles|jester|bells|boing|whisper|zarvox|superstar|trinoids|wobble|bahh|organ|cellos|bad news|good news/.test(n)) {
     s -= 200
   }
@@ -478,14 +495,17 @@ export function createSpeaker(): Speaker {
       const voice = pickVoice()
       if (voice) u.voice = voice
       u.lang = voice?.lang ?? 'en-GB'
-      // Deliberate, and deliberately invariant — the character's pace does not
-      // change with stakes, and that steadiness is most of the effect. This
-      // lands around 130 wpm, below the median for film dialogue.
-      u.rate = 0.92
-      // Mid-baritone, and *not* pushed lower for gravitas. The voice is
-      // clarity-weighted rather than chest-weighted; dropping it further reads
-      // as a film-trailer voiceover, which is the wrong character entirely.
-      u.pitch = 0.95
+      // Deliberate, and deliberately invariant — the character's pace does
+      // not change with stakes, and that steadiness is most of the effect.
+      // A shade slower than the butler it replaced: Morpheus leaves room
+      // around a sentence. Around 125 wpm.
+      u.rate = 0.88
+      // Chest-weighted, which the previous character explicitly was not.
+      // The old note here warned that going lower reads as a film-trailer
+      // voiceover — true, and for Morpheus that is nearer right than wrong.
+      // 0.78 is as far as it goes before the formants smear and consonants
+      // start dropping out, which costs more than the depth is worth.
+      u.pitch = 0.78
 
       // speechSynthesis exposes no amplitude, so drive the reactor from a
       // synthetic envelope. It only has to look like speech, not match it.

@@ -1,0 +1,97 @@
+import { useEffect, useState } from 'react'
+import { useStore, type Provider } from '../store'
+import {
+  capabilitiesProbed,
+  providers as probedProviders,
+  type ProviderState,
+} from '../lib/capabilities'
+
+/**
+ * The two brains, as tiles in the top-right corner.
+ *
+ * This interface has exactly one failure it cannot explain: silence. An
+ * expired Claude login and an absent OpenAI key both produce a turn that says
+ * nothing, and from the outside that is indistinguishable from a microphone
+ * that never heard you. So each tile carries its own readiness, probed from
+ * the bridge at boot, and a tile that cannot answer says why on its face
+ * rather than waiting to disappoint you mid-sentence.
+ *
+ * A tile stays clickable even when it is not ready. Selecting a brain and
+ * being told plainly that it needs a login is a better experience than a
+ * control that ignores the pointer for reasons it does not explain.
+ */
+
+const LABEL: Record<Provider, string> = {
+  claude: 'MORPHEUS-ANT',
+  gpt: 'MORPHEUS-GPT',
+}
+
+/** Roomy enough to read at 9px, short enough not to wrap the tile. */
+function shortDetail(state: ProviderState): string {
+  if (state.ready) return 'READY'
+  const d = state.detail.toLowerCase()
+  if (d.includes('expired')) return 'LOGIN EXPIRED'
+  if (d.includes('not signed in') || d.includes('no login')) return 'NOT SIGNED IN'
+  if (d.includes('openai_api_key')) return 'NO API KEY'
+  if (d.includes('too old')) return 'BRIDGE TOO OLD'
+  if (d.includes('bridge')) return 'NO BRIDGE'
+  return 'UNAVAILABLE'
+}
+
+export function Brains() {
+  const provider = useStore((s) => s.provider)
+  const setProvider = useStore((s) => s.setProvider)
+
+  /**
+   * The probe finishes during boot, after this has already mounted, and it
+   * resolves outside React — so nothing would re-render on its own. One short
+   * poll until it lands is less machinery than threading the result through
+   * the store for a value that is read once and then never changes.
+   */
+  const [state, setState] = useState(probedProviders)
+  useEffect(() => {
+    if (capabilitiesProbed()) {
+      setState(probedProviders())
+      return
+    }
+    const t = setInterval(() => {
+      if (!capabilitiesProbed()) return
+      setState(probedProviders())
+      clearInterval(t)
+    }, 300)
+    return () => clearInterval(t)
+  }, [])
+
+  return (
+    <div className="brains" role="group" aria-label="Which brain answers">
+      {(['claude', 'gpt'] as Provider[]).map((name) => {
+        const s = state[name]
+        const selected = provider === name
+        return (
+          <button
+            key={name}
+            type="button"
+            className={`brain${selected ? ' brain-on' : ''}${
+              s.ready ? '' : ' brain-down'
+            }`}
+            aria-pressed={selected}
+            // The full sentence from the bridge, including the command to run.
+            // The face of the tile has room for a verdict, not a remedy.
+            title={`${LABEL[name]} — ${s.detail}`}
+            onClick={(e) => {
+              setProvider(name)
+              // Space and Enter both activate a focused button, and Space is
+              // also the push-to-talk key. Dropping focus after the click
+              // keeps the next Space press meaning "talk".
+              e.currentTarget.blur()
+            }}
+          >
+            <span className="brain-dot" />
+            <span className="brain-name">{LABEL[name]}</span>
+            <span className="brain-state">{shortDetail(s)}</span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}

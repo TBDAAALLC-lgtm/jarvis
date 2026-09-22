@@ -6,11 +6,12 @@ import { BladeSweep, Blades } from './Blades'
 import { Effects } from './Effects'
 import { Pointer } from './Pointer'
 import { GestureGuide } from './GestureGuide'
+import { Brains } from './Brains'
 
 const statusText: Record<Phase, string> = {
   offline: 'OFFLINE',
   boot: 'INITIALISING',
-  dormant: 'STANDBY — SAY “HEY JARVIS”',
+  dormant: 'STANDBY — SAY “HEY MORPHEUS”',
   waking: 'ONLINE',
   listening: 'LISTENING',
   thinking: 'PROCESSING',
@@ -190,8 +191,8 @@ export function Hud() {
       <header className="hud-top">
         {ui.chrome.brand && (
           <div className="brand">
-            <span className="brand-mark">J.A.R.V.I.S.</span>
-            <span className="brand-sub">Just A Rather Very Intelligent System</span>
+            <span className="brand-mark">MORPHEUS</span>
+            <span className="brand-sub">Voice Interface · Claude and GPT</span>
           </div>
         )}
 
@@ -206,6 +207,10 @@ export function Hud() {
           </span>
         </div>
       </header>
+
+      {/* Below the status line, on the same right-hand gutter. Kept out of
+          `.hud-top` so the flex row that centres the brand is undisturbed. */}
+      <Brains />
 
       {/* Left rail: which integrations are live */}
       {ui.chrome.systems && (
@@ -273,7 +278,7 @@ export function Hud() {
                 exit={{ opacity: 0 }}
                 transition={{ type: 'spring', stiffness: 320, damping: 32 }}
               >
-                <span className="log-who">{t.role === 'user' ? 'YOU' : 'JARVIS'}</span>
+                <span className="log-who">{t.role === 'user' ? 'YOU' : 'MORPHEUS'}</span>
                 {/* Only his half decodes. What the user said was never
                     transmitted from anywhere — dressing it up as machine
                     output would be a lie about where the words came from. */}
@@ -312,7 +317,7 @@ export function Hud() {
 
       <footer className="hud-bottom">
         <span className="hint">
-          say <b>“hey jarvis”</b> · <kbd>Space</kbd> to talk · <kbd>G</kbd> hands
+          say <b>“hey morpheus”</b> · <kbd>Space</kbd> to talk · <kbd>G</kbd> hands
           {voice && (
             <>
               {' · '}
