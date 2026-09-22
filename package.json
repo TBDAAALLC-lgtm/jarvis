@@ -15,7 +15,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "bridge": "node bridge/server.mjs",
-    "bridge:writes": "JARVIS_ALLOW_WRITES=1 node bridge/server.mjs",
+    "bridge:writes": "node bridge/server.mjs --writes",
     "setup": "node scripts/setup.mjs"
   },
   "dependencies": {

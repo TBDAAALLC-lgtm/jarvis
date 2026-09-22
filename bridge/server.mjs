@@ -93,10 +93,18 @@ function originAllowed(origin) {
  * click and the model can't pause for one. So the bridge decides.
  *
  * Read-only and generative tools run freely. Anything that writes to disk,
- * runs a shell, or changes the world waits for JARVIS_ALLOW_WRITES=1. Start
- * without it, and turn it on once you trust what you're demoing.
+ * runs a shell, or changes the world waits for JARVIS_ALLOW_WRITES=1, or the
+ * equivalent --writes flag. Start without it, and turn it on once you trust
+ * what you're demoing.
+ *
+ * The flag exists because the environment variable alone is not portable:
+ * `VAR=1 node ...` in an npm script is POSIX shell syntax, and npm hands its
+ * scripts to cmd.exe on Windows, where that line fails before Node is ever
+ * reached. A flag is parsed by Node itself, so a single script works on every
+ * platform without taking on a cross-env dependency.
  */
-const ALLOW_WRITES = process.env.JARVIS_ALLOW_WRITES === '1'
+const ALLOW_WRITES =
+  process.env.JARVIS_ALLOW_WRITES === '1' || process.argv.includes('--writes')
 
 /**
  * The orchestrator model. Override with JARVIS_MODEL to trade quality for pace
