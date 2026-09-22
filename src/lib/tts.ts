@@ -323,11 +323,11 @@ function outputContext(): AudioContext | null {
  * available — the engine pauses on commas and full stops.
  *
  * This used to also guarantee a comma before the vocative "sir", which was
- * most of the old characterisation. Morpheus has no vocative: he addresses
- * people directly and never by title. The rule is gone rather than ported,
- * because with nothing left to match legitimately it would only ever fire
- * on a sentence that happened to end in the word, and splice a comma into
- * it.
+ * most of the old characterisation. There is no honorific now. A name is
+ * possible (MORPHEUS_NAME on the bridge) but it is never sentence-final by
+ * design, so it needs no comma bought for it. The rule is gone rather than
+ * ported: with nothing left to match legitimately it could only fire on a
+ * sentence that happened to end in that word, and splice a comma into it.
  */
 function shape(text: string): string {
   return (

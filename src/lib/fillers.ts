@@ -1,51 +1,60 @@
 /**
  * Filler speech.
  *
- * A tool call can take ten seconds, and silence that long reads as a crash. So
- * JARVIS says something the instant work starts — then goes quiet until he has
- * an answer. One acknowledgement, no progress chatter.
+ * A tool call can take ten seconds, and silence that long reads as a crash.
+ * So MORPHEUS says something the instant work starts — then goes quiet until
+ * he has an answer. One acknowledgement, no progress chatter.
  *
- * The phrasing follows the character's actual grammar rather than generic
- * assistant-speak, which matters more than it sounds:
+ * These are the most-repeated sentences in the product. A line that is
+ * merely good is wrong here: it has to survive the fiftieth hearing, which
+ * rules out anything that sounds like a line.
  *
- *   - Working lines are subjectless present participles: "Compiling.",
- *     "Cross-referencing." Not "I'm now checking" and never "let me".
- *   - There is no snap-to compliance formula. "Right away" and "At once" are
- *     not in his vocabulary; acknowledgement is deferential, not eager.
- *   - No filler words, no enthusiasm, no apology, no exclamation marks.
- *   - "Sir" fronted means urgency; final means routine. These are all routine,
- *     so it goes at the end, and only sometimes.
+ *   - Working lines are subjectless present participles: "Reading.",
+ *     "Tracing it." Not "I'm now checking" and never "let me".
+ *   - Nothing deferential and nothing eager. He is not taking an order, he
+ *     is telling you where he has gone. There is no "right away" because
+ *     there is no one to hurry for.
+ *   - No vocative at all. The old pool ended half its lines on "sir"; the
+ *     replacement ends them on the verb, which is also where the stress
+ *     belongs.
+ *   - Nothing portentous. "Then we begin" attached to a ten-minute timer is
+ *     funny once and grating after that, so grandeur is the failure mode to
+ *     watch here rather than servility.
+ *   - The urgency ban in the system prompt applies to these too: no "now".
  */
 
 /** Said as soon as the first tool fires, before any answer exists. */
 const WORKING = [
-  'Working on it, sir.',
-  'Compiling.',
-  'Retrieving.',
-  'Accessing the archive.',
+  'Digging.',
+  'Reading.',
+  'Hunting.',
+  'Checking.',
+  'Tracing it.',
   'Cross-referencing.',
-  'Running the query now.',
   'Searching.',
-  'Under way.',
+  'Finding the answer.',
 ]
 
 /** Acknowledging an order where no tool is involved. */
 const ACKNOWLEDGE = [
-  'As you wish, sir.',
-  'Very good, sir.',
-  'Certainly.',
   'Understood.',
-  'Consider it done.',
-  'Directly, sir.',
+  'Yes.',
+  'Clear.',
+  'You will have it.',
+  'It will be.',
+  'Then we do that.',
 ]
 
-/** Answering to his name, before the user has said what they want. */
+/** Answering to his name, before the user has said what they want. Never a
+ *  question: the prompt forbids ending a turn on one, and this is a whole
+ *  turn. 'Awake.' is also gone -- from a thing called Morpheus that is the
+ *  wake-up trope in one word. */
 const ATTENTION = [
-  'Yes, sir?',
-  'Sir?',
-  'At your service, sir.',
-  'Standing by.',
-  'Awake, sir.',
+  'Go ahead.',
+  'Listening.',
+  'Go on.',
+  'Say it.',
+  'Ready.',
 ]
 
 /**
@@ -101,7 +110,7 @@ const BY_TOOL: Rule[] = [
   {
     server: /higgsfield|openrouter-image|dalle|flux|midjourney/,
     tool: /image|photo|thumbnail|render|upscale|seedream/,
-    lines: ['Rendering.', 'Composing it now.'],
+    lines: ['Rendering.', 'Composing it.'],
   },
   // The editors, once the two rules that read the verb have had their turn.
   { server: /palmier|heygen|runway|descript/, lines: FOOTAGE },
@@ -124,27 +133,27 @@ const BY_TOOL: Rule[] = [
   // a Mixpanel event query came out as "Checking your calendar."
   {
     tool: /calendar|\bdiary\b|\bmeeting\b/,
-    lines: ['Checking your calendar.', 'Consulting the diary.'],
+    lines: ['Checking your calendar.', 'Reading the calendar.'],
   },
   {
     server: /elevenlabs|openai-tts/,
     tool: /speech|\bvoice\b|\btts\b|text_to_sound/,
-    lines: ['Synthesising.', 'Working on it, sir.'],
+    lines: ['Synthesising.', 'Making the audio.'],
   },
   {
     server: /spotify|sonos/,
     tool: /\bplay\b|\bmusic\b|playlist|\btrack\b/,
-    lines: ['Queuing it up.', 'Putting it on.'],
+    lines: ['Starting it.', 'Playing it.'],
   },
   {
     server: /^home|homeassistant|\bhue\b|\bhass\b/,
     tool: /\blights?\b|thermostat|\bdimmer\b/,
-    lines: ['Adjusting it now.', 'Seeing to it, sir.'],
+    lines: ['Changing it.', 'Reaching the lights.'],
   },
   {
     server: /github|linear|jira|sentry/,
     tool: /\brepo\b|repository|\bissues?\b|pull_request|\bcommit\b/,
-    lines: ['Checking the repository.', 'Consulting the tracker.'],
+    lines: ['Checking the repository.', 'Reading the tracker.'],
   },
   // Also where the anonymously named analytics servers land — theirs are bare
   // UUIDs, so only the tool half says anything: Get-Report, Get-Events,
@@ -158,7 +167,7 @@ const BY_TOOL: Rule[] = [
   {
     server: /\bexa\b|serper|serpapi|perplexity|tavily|brave/,
     tool: /search|\bweb\b|\bfetch\b|crawl|research/,
-    lines: ['Searching.', 'Consulting the record.'],
+    lines: ['Searching.', 'Reading the results.'],
   },
 ]
 
