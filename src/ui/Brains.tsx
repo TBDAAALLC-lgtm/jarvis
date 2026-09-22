@@ -50,17 +50,40 @@ export function Brains() {
    */
   const [state, setState] = useState(probedProviders)
   useEffect(() => {
+    /**
+     * Land on a brain that can actually answer.
+     *
+     * Remembering the choice across reloads is right until the remembered one
+     * stops working. Then every question goes to a dead brain and returns an
+     * authentication error, with nothing on screen tying that error to that
+     * tile -- so it reads as "it stopped working" rather than "you are asking
+     * the wrong one". Observed exactly that way: one good answer from GPT,
+     * then two questions into a Claude tile that could not serve them.
+     *
+     * Only ever moves off a brain that is down and onto one that is up, and
+     * only once, before the first question. A deliberate choice between two
+     * working brains is never overridden.
+     */
+    const settle = () => {
+      const p = probedProviders()
+      setState(p)
+      const chosen = useStore.getState().provider
+      if (p[chosen]?.ready) return
+      const other: Provider = chosen === 'claude' ? 'gpt' : 'claude'
+      if (p[other]?.ready) setProvider(other)
+    }
+
     if (capabilitiesProbed()) {
-      setState(probedProviders())
+      settle()
       return
     }
     const t = setInterval(() => {
       if (!capabilitiesProbed()) return
-      setState(probedProviders())
+      settle()
       clearInterval(t)
     }, 300)
     return () => clearInterval(t)
-  }, [])
+  }, [setProvider])
 
   return (
     <div className="brains" role="group" aria-label="Which brain answers">

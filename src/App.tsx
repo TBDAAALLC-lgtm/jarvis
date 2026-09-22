@@ -210,9 +210,14 @@ export default function App() {
       if (stale()) return
       console.error(err)
       sfx.play('error')
-      store
-        .getState()
-        .setError(err instanceof Error ? err.message : 'Something went wrong.')
+      // Name the brain. "OAuth session expired" on its own reads as the app
+      // breaking; the same words behind MORPHEUS-ANT point at the tile that
+      // has to change, which is the difference between a fault and an
+      // instruction.
+      const which =
+        store.getState().provider === 'gpt' ? 'MORPHEUS-GPT' : 'MORPHEUS-ANT'
+      const why = err instanceof Error ? err.message : 'Something went wrong.'
+      store.getState().setError(`${which}: ${why}`)
     } finally {
       if (!stale()) {
         speaker.current = null
