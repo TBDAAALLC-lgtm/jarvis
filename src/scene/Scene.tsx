@@ -9,6 +9,7 @@ import {
 } from '@react-three/postprocessing'
 import { BlendFunction } from 'postprocessing'
 import * as THREE from 'three'
+import { EffectsGuard } from './EffectsGuard'
 import { Core } from './Core'
 import { Particles } from './Particles'
 import { Orbits } from './Orbits'
@@ -216,25 +217,32 @@ export function Scene() {
         add a <ToneMapping mode={ToneMappingMode.ACES_FILMIC} /> effect at the
         end of this chain rather than touching the renderer.
       */}
-      <EffectComposer multisampling={0}>
-        {/* Bloom is what turns additive lines into "hologram". */}
-        <Bloom
-          intensity={1.15}
-          // A higher threshold keeps the mid-tones intact so the orb doesn't
-          // flatten into a solid white disc.
-          luminanceThreshold={0.22}
-          luminanceSmoothing={0.85}
-          mipmapBlur
-          radius={0.72}
-        />
-        <ChromaticAberration
-          offset={new THREE.Vector2(0.0009, 0.0012)}
-          radialModulation={false}
-          modulationOffset={0}
-        />
-        <Noise opacity={0.035} blendFunction={BlendFunction.OVERLAY} />
-        <Vignette eskil={false} offset={0.22} darkness={0.95} />
-      </EffectComposer>
+      {/*
+        Guarded because addPass throws when the WebGL context attributes come
+        back null, and that throw lands during commit — taking the whole app
+        down, not just the glow. See EffectsGuard for the full account.
+      */}
+      <EffectsGuard>
+        <EffectComposer multisampling={0}>
+          {/* Bloom is what turns additive lines into "hologram". */}
+          <Bloom
+            intensity={1.15}
+            // A higher threshold keeps the mid-tones intact so the orb doesn't
+            // flatten into a solid white disc.
+            luminanceThreshold={0.22}
+            luminanceSmoothing={0.85}
+            mipmapBlur
+            radius={0.72}
+          />
+          <ChromaticAberration
+            offset={new THREE.Vector2(0.0009, 0.0012)}
+            radialModulation={false}
+            modulationOffset={0}
+          />
+          <Noise opacity={0.035} blendFunction={BlendFunction.OVERLAY} />
+          <Vignette eskil={false} offset={0.22} darkness={0.95} />
+        </EffectComposer>
+      </EffectsGuard>
     </Canvas>
   )
 }
