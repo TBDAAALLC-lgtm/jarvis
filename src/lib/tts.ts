@@ -162,13 +162,13 @@ const MAX_UNSPOKEN = 220
 // Voice selection
 // ---------------------------------------------------------------------------
 
-const VOICE_PREF_KEY = 'morpheus.voice'
+const VOICE_PREF_KEY = 'jarvis.voice'
 
 /**
  * Rank installed voices by how close they are to the character: a deep,
  * level male voice, not a novelty one.
  *
- * Reweighted for Morpheus, who is American and speaks from the chest. The
+ * Reweighted for a deeper, level delivery. The
  * previous ranking was built for a British butler and scored en-GB above
  * everything, which on Windows was actively wrong: Microsoft David and
  * Microsoft Guy — the two deep male voices almost every Windows machine
@@ -324,7 +324,7 @@ function outputContext(): AudioContext | null {
  *
  * This used to also guarantee a comma before the vocative "sir", which was
  * most of the old characterisation. There is no honorific now. A name is
- * possible (MORPHEUS_NAME on the bridge) but it is never sentence-final by
+ * possible (JARVIS_NAME on the bridge) but it is never sentence-final by
  * design, so it needs no comma bought for it. The rule is gone rather than
  * ported: with nothing left to match legitimately it could only fire on a
  * sentence that happened to end in that word, and splice a comma into it.
@@ -498,12 +498,12 @@ export function createSpeaker(): Speaker {
       u.lang = voice?.lang ?? 'en-GB'
       // Deliberate, and deliberately invariant — the character's pace does
       // not change with stakes, and that steadiness is most of the effect.
-      // A shade slower than the butler it replaced: Morpheus leaves room
+      // A shade slower than it was: the delivery leaves room
       // around a sentence. Around 125 wpm.
       u.rate = 0.88
       // Chest-weighted, which the previous character explicitly was not.
       // The old note here warned that going lower reads as a film-trailer
-      // voiceover — true, and for Morpheus that is nearer right than wrong.
+      // voiceover — true, and here that is nearer right than wrong.
       // 0.70 by ear, on request. This note used to claim 0.78 was the floor
       // before formants smear and consonants start dropping out — written
       // from reading rather than listening, and wrong on this machine.

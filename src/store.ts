@@ -281,7 +281,7 @@ type State = {
 /** The two brains the corner tiles switch between. */
 export type Provider = 'claude' | 'gpt'
 
-const PROVIDER_KEY = 'morpheus.provider'
+const PROVIDER_KEY = 'jarvis.provider'
 
 /**
  * Remembered across reloads, because a voice interface is used in short

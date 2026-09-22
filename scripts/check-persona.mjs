@@ -116,25 +116,25 @@ if (!fnSrc) {
   fail('addressBlock() not found')
 } else {
   for (const name of ['', 'Ada']) {
-    process.env.MORPHEUS_NAME = name
+    process.env.JARVIS_NAME = name
     let out
     try {
       out = new Function(`${fnSrc[0]}; return addressBlock()`)()
     } catch (err) {
-      fail(`addressBlock() threw with MORPHEUS_NAME=${JSON.stringify(name)}: ${err.message}`)
+      fail(`addressBlock() threw with JARVIS_NAME=${JSON.stringify(name)}: ${err.message}`)
       continue
     }
     if (!out || out.length < 80) {
-      fail(`addressBlock() returned almost nothing with MORPHEUS_NAME=${JSON.stringify(name)}`)
+      fail(`addressBlock() returned almost nothing with JARVIS_NAME=${JSON.stringify(name)}`)
     }
     if (name && !out.includes(name)) {
-      fail('addressBlock() ignored MORPHEUS_NAME')
+      fail('addressBlock() ignored JARVIS_NAME')
     }
     if (!name && /THEIR NAME IS/.test(out)) {
       fail('addressBlock() claimed a name when none is set')
     }
   }
-  delete process.env.MORPHEUS_NAME
+  delete process.env.JARVIS_NAME
 }
 
 // --- 7. line length --------------------------------------------------------

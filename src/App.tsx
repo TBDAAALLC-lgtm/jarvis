@@ -64,7 +64,7 @@ const newId = () =>
 /** The same mishearings voice.ts accepts for the wake word — otherwise a turn
  *  that woke him as "travis" gets that word sent on to the model as a question. */
 const NAME =
-  '(?:morpheus|morpheous|morphius|morpheus\'s|morphus|morfeus|orpheus|morph)'
+  '(?:jarvis|jarvys|jervis|jarvis\'s|travis|jarviss|java\'s|jarv)'
 /** A bare vocative — "Jarvis", "hey jarvis" — with nothing asked. */
 const BARE_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}[\\s,.!?]*$`, 'i')
 /** A leading vocative on a real command: "Jarvis, what's the weather". */
@@ -211,11 +211,11 @@ export default function App() {
       console.error(err)
       sfx.play('error')
       // Name the brain. "OAuth session expired" on its own reads as the app
-      // breaking; the same words behind MORPHEUS-ANT point at the tile that
+      // breaking; the same words behind JARVIS-CLAUDE point at the tile that
       // has to change, which is the difference between a fault and an
       // instruction.
       const which =
-        store.getState().provider === 'gpt' ? 'MORPHEUS-GPT' : 'MORPHEUS-ANT'
+        store.getState().provider === 'gpt' ? 'JARVIS-GPT' : 'JARVIS-CLAUDE'
       const why = err instanceof Error ? err.message : 'Something went wrong.'
       store.getState().setError(`${which}: ${why}`)
     } finally {

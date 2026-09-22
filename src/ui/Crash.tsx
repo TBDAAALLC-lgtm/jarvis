@@ -26,7 +26,7 @@ export class CrashGuard extends Component<{ children: ReactNode }, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('[morpheus] render crashed', error, info.componentStack)
+    console.error('[jarvis] render crashed', error, info.componentStack)
     this.setState({ where: info.componentStack?.trim().split('\n')[0] ?? '' })
   }
 
@@ -63,7 +63,7 @@ export class CrashGuard extends Component<{ children: ReactNode }, State> {
 
     return (
       <div className="crash">
-        <div className="crash-title">MORPHEUS STOPPED</div>
+        <div className="crash-title">JARVIS STOPPED</div>
         <div className="crash-msg">{error.message || String(error)}</div>
         {where && <div className="crash-where">{where}</div>}
         {error.stack && <pre className="crash-stack">{error.stack}</pre>}

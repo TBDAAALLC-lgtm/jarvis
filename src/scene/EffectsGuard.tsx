@@ -36,7 +36,7 @@ export class EffectsGuard extends Component<{ children: ReactNode }, State> {
 
   componentDidCatch(error: Error) {
     console.warn(
-      '[morpheus] post-processing failed to start, continuing without it. ' +
+      '[jarvis] post-processing failed to start, continuing without it. ' +
         'The reactor will render without bloom. ' +
         (error?.message ?? ''),
     )

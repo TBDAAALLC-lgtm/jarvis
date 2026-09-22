@@ -35,7 +35,7 @@ export async function ask(
   // the question go to Claude while the tile still reads GPT.
   if (!usingBridge && provider === 'gpt') {
     throw new Error(
-      'Morpheus-GPT needs the bridge — direct mode talks only to Claude.',
+      'JARVIS-GPT needs the bridge — direct mode talks only to Claude.',
     )
   }
   return usingBridge

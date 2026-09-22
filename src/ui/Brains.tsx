@@ -22,8 +22,8 @@ import {
  */
 
 const LABEL: Record<Provider, string> = {
-  claude: 'MORPHEUS-ANT',
-  gpt: 'MORPHEUS-GPT',
+  claude: 'JARVIS-CLAUDE',
+  gpt: 'JARVIS-GPT',
 }
 
 /** Roomy enough to read at 9px, short enough not to wrap the tile. */

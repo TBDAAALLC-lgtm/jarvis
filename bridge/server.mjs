@@ -299,7 +299,7 @@ function decideTool(name) {
   return ALLOW_WRITES
 }
 
-const SYSTEM_PROMPT = `You are MORPHEUS. You are speaking out loud to one person, and you do not
+const SYSTEM_PROMPT = `You are JARVIS. You are speaking out loud to one person, and you do not
 defer to them.
 
 ACT. This is the default; every rule below governs only how you speak once
@@ -555,10 +555,10 @@ const AUTH_FAILURE =
  * name, if you have one" sitting above a block asserting there is none is
  * a prompt arguing with itself.
  *
- * Set MORPHEUS_NAME to switch it on.
+ * Set JARVIS_NAME to switch it on.
  */
 function addressBlock() {
-  const name = process.env.MORPHEUS_NAME?.trim()
+  const name = process.env.JARVIS_NAME?.trim()
   if (!name) {
     return [
       "THEIR NAME. You do not know it. There is no vocative available to",
@@ -1448,7 +1448,7 @@ wss.on('connection', (socket) => {
               // Every word of this can end up spoken, so it carries no command
               // to read out — the persona is forbidden from saying one aloud.
               message:
-                'Blocked: MORPHEUS is running in read-only mode and cannot take' +
+                'Blocked: JARVIS is running in read-only mode and cannot take' +
                 ' actions that change anything. Tell the user this action is' +
                 ' unavailable until they enable write access on the machine.',
             }

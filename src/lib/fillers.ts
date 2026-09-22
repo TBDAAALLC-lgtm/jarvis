@@ -2,7 +2,7 @@
  * Filler speech.
  *
  * A tool call can take ten seconds, and silence that long reads as a crash.
- * So MORPHEUS says something the instant work starts — then goes quiet until
+ * So JARVIS says something the instant work starts — then goes quiet until
  * he has an answer. One acknowledgement, no progress chatter.
  *
  * These are the most-repeated sentences in the product. A line that is
@@ -47,7 +47,7 @@ const ACKNOWLEDGE = [
 
 /** Answering to his name, before the user has said what they want. Never a
  *  question: the prompt forbids ending a turn on one, and this is a whole
- *  turn. 'Awake.' is also gone -- from a thing called Morpheus that is the
+ *  turn. 'Awake.' is also gone -- from an assistant with this name that is the
  *  wake-up trope in one word. */
 const ATTENTION = [
   'Go ahead.',
