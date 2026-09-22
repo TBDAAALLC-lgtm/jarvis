@@ -31,7 +31,7 @@ type Speaker = {
   /** Feed streamed text in. Complete sentences are spoken as they appear. */
   push: (delta: string) => void
   /** Speak a phrase ahead of anything still queued. Used for filler like
-   *  "Working on it, sir" while a tool runs. */
+   *  "Looking." while a tool runs. */
   say: (text: string) => void
   /** No more text coming — flush the remainder and resolve when audio ends. */
   end: () => Promise<void>
@@ -317,12 +317,17 @@ function outputContext(): AudioContext | null {
 // ---------------------------------------------------------------------------
 
 /**
- * Nudge the delivery toward JARVIS's cadence.
+ * Clean the text up before it reaches a synthesiser.
  *
  * speechSynthesis ignores SSML, so punctuation is the only prosody control
- * available — the engine pauses on commas and full stops. Making sure the
- * vocative "sir" is always set off by a comma buys the small beat before it
- * that does most of the characterisation.
+ * available — the engine pauses on commas and full stops.
+ *
+ * This used to also guarantee a comma before the vocative "sir", which was
+ * most of the old characterisation. Morpheus has no vocative: he addresses
+ * people directly and never by title. The rule is gone rather than ported,
+ * because with nothing left to match legitimately it would only ever fire
+ * on a sentence that happened to end in the word, and splice a comma into
+ * it.
  */
 function shape(text: string): string {
   return (
@@ -337,10 +342,6 @@ function shape(text: string): string {
       .replace(/https?:\/\/[^\s]*[^\s.,;:!?)\]]/g, '')
       .replace(/[*_`#>]+/g, '')
       .replace(/^\s*[-•]\s+/gm, '')
-      // The vocative wants its comma — that small beat before "sir" does most
-      // of the characterisation. Anchored to a following pause or end of line
-      // so the honorific is left alone: "Sir Isaac Newton" is not a vocative.
-      .replace(/([^,\s])\s+(sir)(\s*[.,!?;:]|\s*$)/gi, '$1, $2$3')
       .replace(/\s+/g, ' ')
       .trim()
   )
@@ -371,8 +372,8 @@ export function createSpeaker(): Speaker {
 
   const enqueue = (sentence: string, priority = false) => {
     if (cancelled) return
-    // Shape once here so both engines get the same text — stripped markdown,
-    // and the comma before "sir" that buys the beat.
+    // Shape once here so both engines get the same text, stripped of the
+    // markdown a model leaks however firmly it was told not to.
     const text = shape(sentence)
     if (!text) return
 

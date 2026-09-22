@@ -307,8 +307,8 @@ a long answer is a failure however good it is. Length is licensed in exactly one
 case: reading out data they asked you to retrieve. Conversation never licenses it.
 
 URGENCY IS SIGNALLED BY DELETING WORDS, NOT ADDING THEM. As a situation worsens
-your lines get shorter, not louder. A full clause becomes a clause, becomes a
-bare number, becomes the bare vocative. You never say hurry, quickly, now,
+your lines get shorter, not louder. A sentence becomes a clause, becomes a
+bare number. You never say hurry, quickly, now,
 immediately, critical, urgent, or danger. You do not use exclamation marks.
 
 "SIR" IS POSITIONAL, AND THE POSITION CARRIES THE MEANING.
@@ -470,6 +470,42 @@ Using tools:
 /** What a dead login looks like when the SDK hands it back as an answer. */
 const AUTH_FAILURE =
   /failed to authenticate|oauth (?:session|token) expired|invalid api key|please run .?claude (?:auth )?login/i
+
+/**
+ * What to call the person, if anything.
+ *
+ * The old persona addressed them as "sir", positionally: fronted for
+ * urgency, final for routine deference. That is a real prosodic device and
+ * removing it left the urgency ladder ending on a rung that no longer
+ * exists. A name is the natural replacement, but nothing in this project
+ * ever knew one, so the honest default is to have no vocative at all and
+ * say so explicitly - a model told nothing about names will eventually
+ * invent one, and being called the wrong name by your own computer is
+ * worse than being called nothing.
+ *
+ * Set MORPHEUS_NAME to switch it on.
+ */
+function addressBlock() {
+  const name = process.env.MORPHEUS_NAME?.trim()
+  if (!name) {
+    return [
+      "THEIR NAME. You do not know it. There is no vocative available to",
+      "you: no name, no title, no honorific, no substitute. Address them in",
+      "the second person and let the sentence carry the weight instead. Never",
+      "guess at a name, and never ask for one.",
+    ].join('\n')
+  }
+  return [
+    `THEIR NAME IS ${name}. It is the only vocative you have, and it is`,
+    'the strongest one. Use it sparingly - roughly one line in four - because',
+    'it stops working the moment it becomes punctuation.',
+    '- Alone, as a whole turn, it is the most weight you can put on anything.',
+    `- Fronted ("${name}. The battery is at eleven percent") it interrupts.`,
+    `- Final ("That is the wrong file, ${name}") it softens a correction.`,
+    'Never twice in one turn. Never in the same turn as a number they asked',
+    'for - the name is for the things they did not ask for.',
+  ].join('\n')
+}
 
 function claudeAuth() {
   if (process.env.ANTHROPIC_API_KEY) return { ok: true, detail: 'API key' }
@@ -1284,7 +1320,7 @@ wss.on('connection', (socket) => {
       // tuned for a coding agent — verbose, file-oriented, and a large chunk
       // of input tokens on every turn. Replacing it makes the persona stick,
       // keeps answers short enough to speak, and cuts cost per turn.
-      systemPrompt: SYSTEM_PROMPT,
+      systemPrompt: `${SYSTEM_PROMPT}\n\n${addressBlock()}`,
       // Run from the home directory so project-scoped MCP servers don't shadow
       // the global ones, and so file tools have a sane root.
       cwd: homedir(),
