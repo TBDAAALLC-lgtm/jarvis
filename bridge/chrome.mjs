@@ -48,13 +48,43 @@ import { join } from 'node:path'
  */
 
 /**
- * Where the native host puts its socket.
+ * Where the native host listens, which is not one answer.
  *
  * `userInfo().username` rather than $USER, which is unset under launchd — and a
  * bridge started from a login item is exactly the case where a wrong guess
  * would look like the extension being uninstalled.
+ *
+ * The rest of the name is the same everywhere; the container is not. On POSIX
+ * the host opens a Unix socket in a directory of its own, one file per host
+ * process, named for the pid. On Windows there are no Unix sockets to open, so
+ * it creates a named pipe instead — and being a kernel object rather than a
+ * file, it has no directory to sit in and no pid in its name. Its own log says
+ * so in as many words:
+ *
+ *   [chrome-native-host] Creating Windows named pipe:
+ *   \\.\pipe\claude-mcp-browser-bridge-User
+ *
+ * One fixed name, recreated on every start. That is also why a second host
+ * instance logs the attempt and never logs success — the name is already taken.
+ *
+ * This file only knew the POSIX half. `readdir('/tmp/...')` on Windows fails
+ * the way any missing directory fails, findSocket returned null, and every
+ * chrome_* tool reported the extension as not running — on a machine where it
+ * was running, with the pipe open, while the persona names those tools as the
+ * first thing to reach for and tells the model not to quietly fall back to a
+ * web search. The most useful capability in the bridge was dead on the platform
+ * it was being used on, and it looked like a browser problem rather than a bug.
+ *
+ * Everything above this line is the same on both: the framing, the request
+ * shape, the replies. Only the address differs.
  */
-const SOCKET_DIR = `/tmp/claude-mcp-browser-bridge-${userInfo().username}`
+const BRIDGE_NAME = `claude-mcp-browser-bridge-${userInfo().username}`
+
+/** POSIX: a directory of per-pid sockets. */
+const SOCKET_DIR = `/tmp/${BRIDGE_NAME}`
+
+/** Windows: one named pipe, in the kernel's pipe namespace. */
+const WINDOWS_PIPE = `\\\\.\\pipe\\${BRIDGE_NAME}`
 
 /**
  * How long a single browser action may take.
@@ -68,6 +98,20 @@ const CALL_TIMEOUT_MS = 45_000
 
 /** Connecting to a socket on the same machine either works at once or is dead. */
 const CONNECT_TIMEOUT_MS = 3_000
+
+/** Said once, so both platforms report an absent extension identically. */
+const NOT_RUNNING =
+  'The Claude browser extension is not running on this machine. ' +
+  'Open Chrome with the Claude extension enabled, then try again.'
+
+/**
+ * Dial failures that mean "nothing is listening" rather than "something broke".
+ *
+ * ENOENT is the pipe or socket file not being there at all. ECONNREFUSED is a
+ * POSIX socket file left behind by a host that has since exited — the file
+ * outlives the process, which is the whole reason findSocket sorts by mtime.
+ */
+const MISSING = new Set(['ENOENT', 'ECONNREFUSED'])
 
 /**
  * Find the socket to talk to.
@@ -83,6 +127,18 @@ const CONNECT_TIMEOUT_MS = 3_000
  * accepted as a last resort, because on some setups it is all there is.
  */
 async function findSocket() {
+  /**
+   * Windows has nothing to choose between.
+   *
+   * The name is fixed, so there is no newest-wins to do — and there is nothing
+   * to stat either: a named pipe is a kernel object, not a file, so the pipe
+   * namespace does not answer `readdir` or `stat` through Node's fs at all.
+   * Handing the path back unconditionally is therefore right, and the question
+   * "is anything actually listening?" moves to the one place that can answer it
+   * honestly, which is the connection attempt itself.
+   */
+  if (process.platform === 'win32') return WINDOWS_PIPE
+
   let names
   try {
     names = await readdir(SOCKET_DIR)
@@ -169,12 +225,8 @@ class ChromeLink {
   async ensureConnected() {
     if (this.socket && !this.socket.destroyed) return
     const path = await findSocket()
-    if (!path) {
-      throw new Error(
-        'The Claude browser extension is not running on this machine. ' +
-          'Open Chrome with the Claude extension enabled, then try again.',
-      )
-    }
+    if (!path) throw new Error(NOT_RUNNING)
+
     await new Promise((resolve, reject) => {
       const socket = createConnection(path)
       const timer = setTimeout(() => {
@@ -196,7 +248,12 @@ class ChromeLink {
       })
       socket.once('error', (err) => {
         clearTimeout(timer)
-        reject(err)
+        // On Windows this is where "not running" shows up, because there is no
+        // directory to find empty first — the pipe either exists or the dial
+        // returns ENOENT. Same sentence either way, so the model is told the
+        // same thing on both platforms instead of one of them getting a raw
+        // errno it cannot act on.
+        reject(MISSING.has(err?.code) ? new Error(NOT_RUNNING) : err)
       })
     })
   }
@@ -819,7 +876,37 @@ export function chromeKit({ allowWrites }) {
   })
 }
 
-/** Whether the extension looks reachable, for the boot log. */
+/**
+ * Whether the extension looks reachable, for the boot log.
+ *
+ * A real dial, not a file test. It has to be on Windows, where findSocket
+ * always returns a path because the pipe namespace cannot be inspected — a file
+ * test there would report the browser ready on a machine with Chrome closed.
+ *
+ * It is also the better answer on POSIX, where the old check was satisfied by
+ * any `.sock` file in the directory. Those outlive the process that made them,
+ * so a machine that had Chrome open yesterday reported browser control ready
+ * today, and the first tool call was the thing that discovered otherwise. The
+ * banner exists to say what is true before anybody asks a question that depends
+ * on it, which means it has to be true.
+ *
+ * Opened and dropped immediately: the link keeps its own connection, and this
+ * is only ever asked once at boot.
+ */
 export async function chromeAvailable() {
-  return (await findSocket()) !== null
+  const path = await findSocket()
+  if (!path) return false
+
+  return new Promise((resolve) => {
+    const socket = createConnection(path)
+    const settle = (ok) => {
+      clearTimeout(timer)
+      socket.removeAllListeners()
+      socket.destroy()
+      resolve(ok)
+    }
+    const timer = setTimeout(() => settle(false), CONNECT_TIMEOUT_MS)
+    socket.once('connect', () => settle(true))
+    socket.once('error', () => settle(false))
+  })
 }
