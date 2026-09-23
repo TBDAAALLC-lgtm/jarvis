@@ -7,7 +7,7 @@ import { probeUrl } from './page.mjs'
  * The `display` tool — JARVIS's screen.
  *
  * Rather than filling in a fixed set of card templates, the model authors the
- * panel itself: markup, layout, emphasis, and which animation it arrives with.
+ * panel itself: markup, layout and emphasis.
  * A search result and a phone screenshot and a revenue figure should not look
  * like the same component with different words in it, and only the thing
  * composing the answer knows what the answer wants to look like.
@@ -38,7 +38,7 @@ styling and the row lands as unformatted text.
   .hud-grid            two-column grid
   .hud-bar             thin progress bar; set style="--v:0.62" for 62%
   .hud-dim             de-emphasise anything
-  .hud-hot             emphasise anything (picks up the accent colour)
+  .hud-hot             emphasise anything
   .hud-gallery         grid container for several images at once
   .hud-thumb           one thumbnail, inside a .hud-gallery or beside a .hud-row
   .hud-video           a <video> player, full width of the panel
@@ -82,8 +82,8 @@ WHERE THE CONTENT COMES FROM — read this before showing anything from the web.
     yourself will not. Never guess one.
 
 RULES
-  - No inline colours. The accent is themed by the 'accent' argument; use the
-    classes and it follows automatically.
+  - No inline colours. The classes carry the interface's own palette; use them
+    and it follows automatically.
   - No <style>, <script>, <form>, or event handlers. They are stripped.
   - <iframe> is allowed for exactly three hosts: www.youtube-nocookie.com/embed,
     www.youtube.com/embed and player.vimeo.com/video. Any other src and the
@@ -150,31 +150,34 @@ const schema = {
         'this tool description. Author it for the specific content — a list, an ' +
         'image, a number and a caption, whatever fits.',
     ),
-  anim: z
-    .enum(['materialise', 'sweep', 'unfold', 'stagger', 'snap'])
-    .default('materialise')
+  /**
+   * What is left after the panels became blades.
+   *
+   * This schema used to carry `anim` (five named arrivals), `slot` (left,
+   * right, wide) and `accent` (five colours), each documented in detail and
+   * none of them read by anything. The handler emits `{id, title, kind, html,
+   * size, hold}`, and a Blade has no field for an animation or a colour, so
+   * every one of those arguments was accepted, described at length, and
+   * dropped.
+   *
+   * That is worse than a missing feature, because the model believed the
+   * description. Told it could place two panels on opposite sides of the
+   * reactor, it would issue two calls and then *speak* about a side-by-side
+   * comparison — while the user looked at two stacked blades, the second
+   * covering the first. The interface was made to lie by its own tool
+   * description. The GPT path paid for it twice over, re-posting those dead
+   * paragraphs on every round of every turn.
+   *
+   * `size` is what genuinely survived: it is the one distinction a blade really
+   * makes, so it is named for what it does rather than pretending to be a
+   * position.
+   */
+  size: z
+    .enum(['compact', 'wide'])
+    .default('compact')
     .describe(
-      'How it arrives. materialise = scan-wipe reveal, the default. ' +
-        'sweep = slides in from the edge, good for results. ' +
-        'unfold = expands vertically, good for images. ' +
-        'stagger = children land one after another, good for lists. ' +
-        'snap = instant with a flicker, good for alerts and single figures.',
-    ),
-  slot: z
-    .enum(['right', 'left', 'wide'])
-    .default('right')
-    .describe(
-      'Where it sits. right = the default stack beside the reactor. ' +
-        'left = the opposite side, for a second simultaneous panel. ' +
-        'wide = a broader card under the reactor, for images or dense tables.',
-    ),
-  accent: z
-    .enum(['default', 'amber', 'violet', 'green', 'red'])
-    .default('default')
-    .describe(
-      'Colour identity. default = the interface cyan. amber = caution or ' +
-        'pending. violet = generated or synthetic content. green = confirmed ' +
-        'or healthy. red = failure or alert. Use it meaningfully, not decoratively.',
+      'How much room it needs. compact = the default card. ' +
+        'wide = a broader one, for images or dense tables.',
     ),
   hold: z
     .enum(['turn', 'sticky'])
@@ -372,7 +375,7 @@ export function displayKit(emit, emitBlade) {
           title: String(args.title ?? '').trim() || 'DISPLAY',
           kind: 'markup',
           html: args.html,
-          size: args.slot === 'wide' ? 'wide' : 'compact',
+          size: args.size === 'wide' ? 'wide' : 'compact',
           hold: args.hold ?? 'turn',
         })
         return { content: [{ type: 'text', text: 'On screen.' }] }

@@ -25,7 +25,8 @@ import { join } from 'node:path'
  *   Chrome extension  (fcoeoabgfenejglbffodgkkbkcdhcgfn)
  *        ↕  Chrome Native Messaging: 4-byte little-endian length + JSON
  *   chrome-native-host
- *        ↕  Unix socket: /tmp/claude-mcp-browser-bridge-<user>/<pid>.sock
+ *        ↕  POSIX:   /tmp/claude-mcp-browser-bridge-<user>/<pid>.sock
+ *        ↕  Windows: \\.\pipe\claude-mcp-browser-bridge-<user>
  *   whoever connects  ← this file
  *
  * What Claude Code normally does at that last step is detour through
@@ -300,12 +301,29 @@ class ChromeLink {
    * than telling the user their browser is unavailable when it is sitting right
    * there. A second failure is real and is reported.
    */
-  call(name, args) {
+  call(name, args, signal) {
     const run = async () => {
+      /**
+       * Interrupted before this one's turn in the queue came up.
+       *
+       * Calls are serialised, so a batch can sit here for seconds behind
+       * whatever is already talking to the browser. Running them anyway means
+       * the user's real Chrome navigates somewhere they cancelled — and then
+       * settle() polls the page they did not ask for.
+       *
+       * Checked here rather than only at the head, because the wire protocol
+       * has no request id: a call already sent cannot be recalled without
+       * desynchronising every reply after it. So one in flight is allowed to
+       * finish and its answer is discarded upstream; one not yet sent is simply
+       * never sent.
+       */
+      if (signal?.aborted) throw new Error('the user interrupted')
+
       const message = { method: 'execute_tool', params: { tool: name, args: args ?? {} } }
       try {
         return await this.request(message)
       } catch (err) {
+        if (signal?.aborted) throw err
         this.reset()
         return await this.request(message)
       }
@@ -320,8 +338,6 @@ class ChromeLink {
     return result
   }
 }
-
-const link = new ChromeLink()
 
 /**
  * Turn a native-host reply into an MCP result.
@@ -410,22 +426,6 @@ function clean(content) {
   return stripped.length ? stripped : [{ type: 'text', text: 'Done.' }]
 }
 
-/**
- * The tab JARVIS is working in.
- *
- * Remembered here rather than threaded through the model, because making the
- * model carry it is both unreliable and pointless. Unreliable: it is a
- * ten-digit integer that has to survive being read out of one tool result and
- * written into the next, and the failure mode when it does not is the useless
- * "No tab available". Pointless: there is one visible browser window and the
- * user is looking at it — "the tab" is not ambiguous to anybody except the
- * protocol.
- *
- * Cleared whenever the extension says the tab is gone, so a tab the user closed
- * by hand costs one retry rather than an unusable browser.
- */
-let activeTab = null
-
 /** Pull a usable tabId out of a tabs_context reply. */
 function readTab(reply) {
   const blocks = reply?.result?.content
@@ -460,8 +460,33 @@ function readTab(reply) {
  * prints a `URL:` line describing the document it actually parsed. When that
  * line agrees with the target, the page really has landed.
  */
-const SETTLE_TRIES = 16
-const SETTLE_GAP_MS = 400
+/**
+ * ...but the target is the wrong thing to wait for.
+ *
+ * `navigate` follows redirects, so the URL the model asked for is frequently
+ * not the URL that lands: a shortener from a tool result, a locale redirect
+ * (ikea.com -> ikea.com/gb/en/), a consent or login wall. Waiting for the
+ * document to report the *requested* address means waiting for something that
+ * is never going to happen, and the old loop then ran all sixteen polls before
+ * returning — with no signal that it had given up rather than matched.
+ *
+ * That is not an edge case, it is most links, and the cost is paid on the
+ * success path: about six and a half seconds of sleeps plus sixteen round trips
+ * to the extension, during which the persona is under instruction to go silent
+ * while using a tool. The interface simply stops for seven seconds on a
+ * navigation that worked immediately. And because every poll goes through the
+ * shared request chain, the browser is unavailable to anything else throughout.
+ *
+ * So the question changes from "is this the page I asked for" to "has the page
+ * stopped changing". Landing on the target is kept as a fast exit because it is
+ * the common case and it is unambiguous; otherwise two consecutive polls
+ * reporting the same URL means the redirects have finished. The gap grows, so a
+ * page that settles at once costs one short poll rather than a fixed tax, and
+ * the whole thing is capped in wall-clock rather than in attempts.
+ */
+const SETTLE_GAP_MS = 120
+const SETTLE_MAX_GAP_MS = 500
+const SETTLE_BUDGET_MS = 3_000
 
 /** Same page? Compared on origin + path, since fragments and trailing slashes
  *  differ freely between what you ask for and what you get. */
@@ -478,11 +503,67 @@ function samePage(a, b) {
   }
 }
 
-async function settle(tab, target) {
-  for (let i = 0; i < SETTLE_TRIES; i++) {
+/**
+ * One browser session per connection.
+ *
+ * The link and the remembered tab used to live at module scope, and they were
+ * the only per-socket state in this bridge that did — server.mjs builds the
+ * other three kits inside `wss.on('connection')` precisely so that each socket
+ * gets its own. This one was shared, and outlived every socket that used it.
+ *
+ * What that costs: reload the page mid-turn and the old connection's Claude
+ * pump can still be running, still holding the request chain. The new
+ * connection builds fresh kits and is handed the same link and the same
+ * `activeTab` — so the next question queues behind the abandoned turn's polling
+ * and then answers about the page that turn navigated to, not the one in front
+ * of the user. `chrome_new_tab` from either connection blanked the other's tab
+ * pointer; `chrome_close_tab` cleared it by comparing against the other's id.
+ *
+ * Per connection now, which is also what makes the tab pointer honest: it means
+ * "the tab this conversation is working in" rather than "the last tab anyone
+ * touched".
+ */
+function browserSession() {
+  const link = new ChromeLink()
+
+  /**
+   * The tab JARVIS is working in.
+   *
+   * Remembered here rather than threaded through the model, because making the
+   * model carry it is both unreliable and pointless. Unreliable: it is a
+   * ten-digit integer that has to survive being read out of one tool result and
+   * written into the next, and the failure mode when it does not is the useless
+   * "No tab available". Pointless: there is one visible browser window and the
+   * user is looking at it — "the tab" is not ambiguous to anybody except the
+   * protocol.
+   *
+   * Cleared whenever the extension says the tab is gone, so a tab the user
+   * closed by hand costs one retry rather than an unusable browser.
+   */
+  let activeTab = null
+
+  /** The tab to act on: the one named, the one we remember, or a fresh one. */
+  async function resolveTab(given) {
+    if (given !== undefined && given !== null && `${given}`.trim() !== '') {
+      const asked = Number(given)
+      if (Number.isFinite(asked)) return asked
+    }
+    if (activeTab !== null) return activeTab
+    const reply = await link.call('tabs_context_mcp', { createIfEmpty: true })
+    activeTab = readTab(reply)
+    return activeTab
+  }
+
+  async function settle(tab, target, signal) {
+  const deadline = Date.now() + SETTLE_BUDGET_MS
+  let gap = SETTLE_GAP_MS
+  let previous = null
+
+  while (Date.now() < deadline) {
+    if (signal?.aborted) return
     let reply
     try {
-      reply = await link.call('get_page_text', { tabId: tab, max_chars: 200 })
+      reply = await link.call('get_page_text', { tabId: tab, max_chars: 200 }, signal)
     } catch {
       return // the browser went away; the caller's own error path will say so
     }
@@ -490,23 +571,20 @@ async function settle(tab, target) {
     const text = Array.isArray(blocks)
       ? blocks.map((b) => (typeof b?.text === 'string' ? b.text : '')).join('\n')
       : ''
-    const at = /^URL:\s*(\S+)/m.exec(text)
-    if (at && samePage(at[1], target)) return
-    await new Promise((r) => setTimeout(r, SETTLE_GAP_MS))
-  }
-}
+    const at = /^URL:\s*(\S+)/m.exec(text)?.[1] ?? null
 
-/** The tab to act on: the one named, the one we remember, or a fresh one. */
-async function resolveTab(given) {
-  if (given !== undefined && given !== null && `${given}`.trim() !== '') {
-    const asked = Number(given)
-    if (Number.isFinite(asked)) return asked
+    // Arrived where we were aimed. Unambiguous, and the common case.
+    if (at && samePage(at, target)) return
+    // Or arrived somewhere and stayed there: the redirects are done. Requires
+    // two readings, because the first poll can catch the document mid-hop and
+    // one sighting of an address proves nothing about whether it is final.
+    if (at && previous && samePage(at, previous)) return
+    previous = at
+
+    await new Promise((r) => setTimeout(r, gap))
+    gap = Math.min(gap * 2, SETTLE_MAX_GAP_MS)
   }
-  if (activeTab !== null) return activeTab
-  const reply = await link.call('tabs_context_mcp', { createIfEmpty: true })
-  activeTab = readTab(reply)
-  return activeTab
-}
+  }
 
 /**
  * Every tool here is the same two lines; only the name and the schema differ.
@@ -515,22 +593,23 @@ async function resolveTab(given) {
  * a page — listing tabs, opening one — which are also the ones that would
  * deadlock if resolving a tab called them.
  */
-function forward(name, { needsTab = true } = {}) {
-  return async (args) => {
+  function forward(name, { needsTab = true } = {}) {
+  return async (args, extra) => {
+    const signal = extra?.signal
     try {
       let sent = args ?? {}
       if (needsTab) {
         const tab = await resolveTab(sent.tabId)
         sent = tab === null ? sent : { ...sent, tabId: tab }
       }
-      let reply = await link.call(name, sent)
+      let reply = await link.call(name, sent, signal)
       // The tab we remembered has gone — the user closed it, or Chrome was
       // restarted under us. Forget it and try once with a fresh one before
       // reporting a browser that is actually working fine.
       if (needsTab && reply?.error && /no tab available/i.test(JSON.stringify(reply.error))) {
         activeTab = null
         const tab = await resolveTab(undefined)
-        if (tab !== null) reply = await link.call(name, { ...(args ?? {}), tabId: tab })
+        if (tab !== null) reply = await link.call(name, { ...(args ?? {}), tabId: tab }, signal)
       }
       return toResult(reply)
     } catch (err) {
@@ -548,6 +627,20 @@ function forward(name, { needsTab = true } = {}) {
         ],
       }
     }
+  }
+  }
+
+  return {
+    link,
+    forward,
+    settle,
+    resolveTab,
+    /** A fresh tab was opened, so stop steering the old one. */
+    forgetTab: () => {
+      activeTab = null
+    },
+    /** Was this the tab we were working in? Asked before closing one. */
+    isActiveTab: (id) => Number(id) === activeTab,
   }
 }
 
@@ -609,6 +702,10 @@ be clicked. Use chrome_page_text instead when you only want the prose.`
  * @param {{ allowWrites: boolean }} options
  */
 export function chromeKit({ allowWrites }) {
+  // This connection's own browser session. Built here, with the kit, so it
+  // lives exactly as long as the socket that is using it.
+  const { forward, settle, resolveTab, forgetTab, isActiveTab } = browserSession()
+
   const tools = [
     tool(
       'chrome_status',
@@ -616,7 +713,7 @@ export function chromeKit({ allowWrites }) {
         'Call this first if a browser action has just failed, so you can tell ' +
         'the user whether the problem is the browser or the page.',
       {},
-      async () => {
+      async (_args, extra) => {
         const path = await findSocket()
         if (!path) {
           return {
@@ -630,7 +727,7 @@ export function chromeKit({ allowWrites }) {
             ],
           }
         }
-        return forward('tabs_context_mcp', { needsTab: false })({ createIfEmpty: false })
+        return forward('tabs_context_mcp', { needsTab: false })({ createIfEmpty: false }, extra)
       },
     ),
 
@@ -657,16 +754,16 @@ export function chromeKit({ allowWrites }) {
           .describe('Absolute URL, or "back" / "forward" to move through history.'),
         tabId,
       },
-      async (args) => {
-        const out = await forward('navigate')(args)
+      async (args, extra) => {
+        const out = await forward('navigate')(args, extra)
         if (out.isError) return out
         // Do not hand back until the page is really there. Everything the model
         // does next — reading it, screenshotting it, answering about it — is
         // wrong if it runs against the document this one replaced.
         const url = String(args.url ?? '')
         if (/^https?:\/\//i.test(url)) {
-          await settle(await resolveTab(args.tabId), url)
-        } else {
+          await settle(await resolveTab(args.tabId), url, extra?.signal)
+        } else if (!extra?.signal?.aborted) {
           // back / forward: no target to compare against, so just let it breathe.
           await new Promise((r) => setTimeout(r, 700))
         }
@@ -729,7 +826,7 @@ export function chromeKit({ allowWrites }) {
       // — but a screenshot is a read and runs in read-only mode, so if the
       // first lock ever slipped, the tool that escalated to `left_click` in the
       // user's signed-in browser would be this one.
-      async (args) => forward('computer')({ ...args, action: 'screenshot' }),
+      async (args, extra) => forward('computer')({ ...args, action: 'screenshot' }, extra),
     ),
 
     tool(
@@ -741,14 +838,17 @@ export function chromeKit({ allowWrites }) {
         amount: z.union([z.number(), z.string()]).optional().catch(undefined),
         tabId,
       },
-      async (args) =>
-        forward('computer')({
-          action: 'scroll',
-          scroll_direction: args.direction ?? 'down',
-          scroll_amount: args.amount ?? 3,
-          coordinate: [400, 400],
-          tabId: args.tabId,
-        }),
+      async (args, extra) =>
+        forward('computer')(
+          {
+            action: 'scroll',
+            scroll_direction: args.direction ?? 'down',
+            scroll_amount: args.amount ?? 3,
+            coordinate: [400, 400],
+            tabId: args.tabId,
+          },
+          extra,
+        ),
     ),
 
     tool(
@@ -803,21 +903,21 @@ export function chromeKit({ allowWrites }) {
             .describe('[x, y] fallback when there is no ref.'),
           tabId,
         },
-        async (args) => forward('computer')({ ...args, action: 'left_click' }),
+        async (args, extra) => forward('computer')({ ...args, action: 'left_click' }, extra),
       ),
 
       tool(
         'chrome_type',
         'Type text into whatever is focused. Click the field first.',
         { text: z.string(), tabId },
-        async (args) => forward('computer')({ ...args, action: 'type' }),
+        async (args, extra) => forward('computer')({ ...args, action: 'type' }, extra),
       ),
 
       tool(
         'chrome_key',
         'Press a key or chord, e.g. "Return", "Escape", "cmd+a".',
         { text: z.string().describe('The key to press.'), tabId },
-        async (args) => forward('computer')({ ...args, action: 'key' }),
+        async (args, extra) => forward('computer')({ ...args, action: 'key' }, extra),
       ),
 
       tool(
@@ -837,9 +937,9 @@ export function chromeKit({ allowWrites }) {
         'Open a fresh blank tab and work in it from now on.',
         {},
         async (args) => {
-          const out = await forward('tabs_create_mcp', { needsTab: false })(args)
+          const out = await forward('tabs_create_mcp', { needsTab: false })(args, extra)
           // Whatever was just opened is what the next action should land in.
-          activeTab = null
+          forgetTab()
           return out
         },
       ),
@@ -853,8 +953,8 @@ export function chromeKit({ allowWrites }) {
             .describe('The numeric tabId to close, from chrome_tabs.'),
         },
         async (args) => {
-          const out = await forward('tabs_close_mcp', { needsTab: false })(args)
-          if (Number(args.tabId) === activeTab) activeTab = null
+          const out = await forward('tabs_close_mcp', { needsTab: false })(args, extra)
+          if (isActiveTab(args.tabId)) forgetTab()
           return out
         },
       ),

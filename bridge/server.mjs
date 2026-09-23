@@ -27,7 +27,7 @@ import { readFileSync, realpathSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
-import { probeUrl, renderPage } from './page.mjs'
+import { renderPage } from './page.mjs'
 import { openaiKey } from './openai.mjs'
 import { forgetImages, runTurn, trim } from './gpt.mjs'
 
@@ -1340,17 +1340,51 @@ wss.on('connection', (socket) => {
   const waiting = new Map()
   let asks = 0
 
-  const ask = (kind, args, timeoutMs = 20_000) =>
+  const ask = (kind, args, timeoutMs = 20_000, signal) =>
     new Promise((resolve, reject) => {
       if (socket.readyState !== socket.OPEN) {
         return reject(new Error('the interface is not connected'))
       }
+      if (signal?.aborted) return reject(new Error('the user interrupted'))
+
       const id = `q${++asks}`
       const timer = setTimeout(() => {
         waiting.delete(id)
+        signal?.removeEventListener('abort', cancel)
         reject(new Error('the interface did not answer in time'))
       }, timeoutMs)
-      waiting.set(id, { resolve, timer })
+
+      /**
+       * Telling the browser to stop, not just giving up on its answer.
+       *
+       * This is the half that was missing, and it was the half that mattered.
+       * `watch` holds this promise open for up to fifteen seconds while the
+       * camera records, and an interrupt used to reach only as far as the
+       * bridge: the turn unwound, and over in the browser the capture ran to
+       * completion with the hardware light on and the on-screen indicator up.
+       * The user said stop looking at me, and the machine kept looking for the
+       * rest of the countdown.
+       *
+       * vision.mjs rests its entire safety argument on that indicator being
+       * true for exactly as long as the camera is live, so a cancel that does
+       * not cross the socket is not a cancel. The frame goes first, then the
+       * rejection.
+       */
+      const cancel = () => {
+        clearTimeout(timer)
+        waiting.delete(id)
+        send({ type: 'cancel', id })
+        reject(new Error('the user interrupted'))
+      }
+      signal?.addEventListener('abort', cancel, { once: true })
+
+      waiting.set(id, {
+        resolve: (value) => {
+          signal?.removeEventListener('abort', cancel)
+          resolve(value)
+        },
+        timer,
+      })
       send({ type: kind, id, ...args })
     })
 
@@ -1600,6 +1634,7 @@ wss.on('connection', (socket) => {
                   body,
                 )
                 sendClaude({ type: 'error', message: body })
+                turnLive = false
                 finishTurn?.()
                 finishTurn = null
                 seenTools.clear()
@@ -1623,6 +1658,7 @@ wss.on('connection', (socket) => {
             }
             // Whatever was waiting on this turn to finish can go now. This is
             // the only place a turn is genuinely over.
+            turnLive = false
             finishTurn?.()
             finishTurn = null
             // One turn's tool ids are never referred to again, and these
@@ -1690,6 +1726,7 @@ wss.on('connection', (socket) => {
     // Anything waiting on this turn is never going to be told it finished by
     // the stream, because the stream is gone. Release it here or the next
     // question sits behind the settle cap for a turn that cannot end.
+    turnLive = false
     finishTurn?.()
     finishTurn = null
     session.close?.()
@@ -1783,10 +1820,51 @@ wss.on('connection', (socket) => {
       // The interrupt handshake waits on this. An OpenAI turn produces no
       // SDK 'result' message, so nothing else would ever release it and
       // the next question would sit behind the settle cap for nothing.
+      turnLive = false
       finishTurn?.()
       finishTurn = null
     }
   }
+
+  /**
+   * Stop whichever brain is talking, and hold the next question behind it.
+   *
+   * Was written inline in the `interrupt` branch, which made it look like
+   * something only the client could ask for. It is not: a new question arriving
+   * while a turn is live has to do exactly this too, and doing it in one place
+   * is what makes the two cases identical rather than merely similar.
+   */
+  function stopTalking() {
+    // Held so the next question can wait for it rather than racing it.
+    const stopped = turnFinished()
+    // Whichever one is talking. Aborting an idle provider is a no-op,
+    // so there is nothing to track about who spoke last.
+    gptAbort?.abort()
+    settling = Promise.resolve(session.interrupt?.())
+      .catch(() => {})
+      .then(() =>
+        Promise.race([stopped, new Promise((r) => setTimeout(r, SETTLE_CAP_MS))]),
+      )
+  }
+
+  /**
+   * Whether a turn is running right now.
+   *
+   * Nothing used to ask. `settling` is an already-resolved promise unless an
+   * interrupt happened, so a second `ask` with no interrupt simply started
+   * alongside the first — and since both providers wrote the same turn tag, a
+   * live Claude turn and a new GPT turn would stamp their deltas with the same
+   * id and interleave into one spoken answer. Two brains' sentences spliced
+   * together, mid-word.
+   *
+   * That is reachable from the shipped client, which only sends `interrupt`
+   * while it still holds a pending turn — so any path that clears `pending`
+   * early sends the next question with no interrupt at all.
+   *
+   * One turn at a time is the actual rule; this is the bridge enforcing it
+   * rather than trusting the client to.
+   */
+  let turnLive = false
 
   socket.on('message', (raw) => {
     let msg
@@ -1813,7 +1891,14 @@ wss.on('connection', (socket) => {
       const text = msg.text
       const id = typeof msg.id === 'string' ? msg.id : null
       const provider = msg.provider === 'gpt' ? 'gpt' : 'claude'
+
+      // A new question while one is still being answered IS an interrupt,
+      // whether or not the client said so. Asking for the same settle the
+      // explicit path asks for is what stops the two turns overlapping.
+      if (turnLive) stopTalking()
+
       void settling.then(() => {
+        turnLive = true
         if (provider === 'gpt') {
           void answerWithGpt(text, id)
           return
@@ -1838,21 +1923,7 @@ wss.on('connection', (socket) => {
       }
     }
 
-    if (msg.type === 'interrupt') {
-      // Held so the next question can wait for it rather than racing it.
-      const stopped = turnFinished()
-      // Whichever one is talking. Aborting an idle provider is a no-op,
-      // so there is nothing to track about who spoke last.
-      gptAbort?.abort()
-      settling = Promise.resolve(session.interrupt?.())
-        .catch(() => {})
-        .then(() =>
-          Promise.race([
-            stopped,
-            new Promise((r) => setTimeout(r, SETTLE_CAP_MS)),
-          ]),
-        )
-    }
+    if (msg.type === 'interrupt') stopTalking()
   })
 
   socket.on('close', () => {

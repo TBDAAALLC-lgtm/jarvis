@@ -227,7 +227,7 @@ function parserFor(spec) {
  * throw would reject out of the GPT loop and end the turn, so the two brains
  * would fail differently at the same tool. They fail the same way now.
  */
-export async function callTool(reg, name, args, { decide, refusal }) {
+export async function callTool(reg, name, args, { decide, refusal, signal }) {
   const spec = reg.get(name)
   if (!spec) {
     return { text: `No such tool: ${name}.`, images: [], isError: true }
@@ -252,7 +252,17 @@ export async function callTool(reg, name, args, { decide, refusal }) {
   }
 
   try {
-    return flatten(await spec.handler(parsed.data, {}))
+    /**
+     * The second argument is how a tool learns it has been called off.
+     *
+     * The SDK passes `{ signal, requestId }` here on the Claude path, and this
+     * used to pass `{}` — so a GPT tool could not be interrupted at all, and
+     * the signal the SDK was already providing on the other side was going
+     * unused by every handler anyway. Both now receive the same thing under the
+     * same name, which is what lets `look`, `watch` and the browser tools be
+     * abort-aware once rather than twice.
+     */
+    return flatten(await spec.handler(parsed.data, { signal }))
   } catch (err) {
     return {
       text: `The tool failed: ${err?.message ?? err}`,

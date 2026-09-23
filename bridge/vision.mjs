@@ -94,10 +94,15 @@ export function visionKit(ask) {
                 'the camera is live. They can see the light; tell them why.',
             ),
         },
-        async (args) => {
+        async (args, extra) => {
           let reply
           try {
-            reply = await ask('capture', { reason: String(args.reason ?? '').slice(0, 80) })
+            reply = await ask(
+              'capture',
+              { reason: String(args.reason ?? '').slice(0, 80) },
+              20_000,
+              extra?.signal,
+            )
           } catch (err) {
             return {
               isError: true,
@@ -163,7 +168,7 @@ export function visionKit(ask) {
             .catch(undefined)
             .describe('A few words on what you are watching for, shown on screen.'),
         },
-        async (args) => {
+        async (args, extra) => {
           let reply
           try {
             reply = await ask(
@@ -177,6 +182,10 @@ export function visionKit(ask) {
               // Generous: a forward watch genuinely takes as long as it says it
               // will, and timing out mid-recording would discard the whole clip.
               45_000,
+              // The one call the user is most likely to interrupt, and the one
+              // where carrying on regardless means the camera stays live after
+              // they asked it not to be.
+              extra?.signal,
             )
           } catch (err) {
             return {

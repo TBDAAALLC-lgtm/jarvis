@@ -86,12 +86,40 @@ const KILL = [
   'iframe', 'object', 'embed', 'applet', 'link', 'meta',
 ]
 
-function stripDangerous(html) {
+/**
+ * `keepStyling` is what separates the two modes.
+ *
+ * Reader mode pulls the words out and restyles them, so a publisher's CSS is
+ * noise and killing it is right. Live mode's entire purpose is for the page to
+ * look like itself — and it was stripping every <style> block and every
+ * stylesheet <link> before serving, then serving the result under a CSP that
+ * grants `style-src https:` and `font-src https:`. Both grants were dead the
+ * moment they were written: nothing was left to use them.
+ *
+ * So live mode keeps the styling and nothing else. <link> is the one tag here
+ * that is not uniformly noise — `rel=stylesheet` is the whole point, while
+ * preload, prefetch, modulepreload and import are all ways to pull in something
+ * that is not a stylesheet — so those go by rel rather than by tag.
+ */
+function stripDangerous(html, { keepStyling = false } = {}) {
+  const KEEP_FOR_STYLE = new Set(['style', 'link'])
+  const kill = keepStyling ? KILL.filter((t) => !KEEP_FOR_STYLE.has(t)) : KILL
+
   let out = html.replace(/<!--[\s\S]*?-->/g, '')
-  for (const tag of KILL) {
+  for (const tag of kill) {
     out = out.replace(new RegExp(`<${tag}\\b[\\s\\S]*?</${tag}\\s*>`, 'gi'), '')
     // Void and unclosed forms of the same tags.
     out = out.replace(new RegExp(`<${tag}\\b[^>]*/?>`, 'gi'), '')
+  }
+  // Every <link> that is not a stylesheet, now that the tag itself survives.
+  // Written as an allowlist: an unrecognised rel is dropped, so a rel invented
+  // after this was written does not get in by not being on a ban list.
+  if (keepStyling) {
+    out = out.replace(/<link\b[^>]*>/gi, (tag) =>
+      /\brel\s*=\s*(?:"\s*stylesheet\s*"|'\s*stylesheet\s*'|stylesheet[\s/>])/i.test(tag)
+        ? tag
+        : '',
+    )
   }
   // Inline event handlers, and the two URL schemes that are code.
   out = out.replace(/\son[a-z]+\s*=\s*(["'])[\s\S]*?\1/gi, '')
@@ -365,9 +393,18 @@ ${blocks.join('\n') || '<p class="rd-p">Nothing readable could be extracted from
  * the publisher and loads normally, so the page looks like itself. What it
  * cannot do is run — the response carries `script-src 'none'` and every
  * <script> is gone from the markup before it is served.
+ *
+ * That was the design, and two lines elsewhere cancelled it. The response's own
+ * CSP ended `base-uri 'none'`, which is precisely the directive that tells the
+ * browser to ignore a document's <base> — so the injected one was dead on
+ * arrival and every relative URL resolved against http://localhost:8787/page?…
+ * instead, giving a 404 from this bridge for each one. And stripDangerous
+ * removed every stylesheet before the CSP was ever consulted. Live mode
+ * therefore rendered an unstyled document with broken images: exactly the thing
+ * the mode exists to avoid, on a page the user chose it for.
  */
 function toLive(html, pageUrl) {
-  let out = stripDangerous(html)
+  let out = stripDangerous(html, { keepStyling: true })
   // Anything the page said about its own framing or transport belongs to a
   // context that no longer exists, and a stale <base> would send every relative
   // URL somewhere we did not choose.
@@ -417,11 +454,28 @@ export async function renderPage(url, mode, bridgeOrigin) {
   // here — an iframe gets its rules from its own response — so this is the only
   // thing standing between a hostile page and script execution on an origin
   // that is allowed to open the agent socket.
+  /**
+   * Live mode needs its own <base> to work, so it cannot forbid all of them.
+   *
+   * Scoped to the page's own origin rather than dropped: that is the one value
+   * the injected base can take, so the directive still refuses every other
+   * target. toLive also strips any <base> the publisher wrote before injecting
+   * ours, which means this is the second lock rather than the only one — but a
+   * document that arrives with a <base> pointing somewhere else is exactly the
+   * case worth having two of.
+   */
+  let liveBase = "'none'"
+  try {
+    liveBase = new URL(page.url).origin
+  } catch {
+    /* unparseable, so nothing can be a valid base anyway */
+  }
+
   const csp = live
     ? "default-src 'none'; img-src https: http: data: blob:; " +
       "style-src 'unsafe-inline' https: http: data:; font-src https: http: data:; " +
       `media-src https: http: data:; script-src 'nonce-${nonce}'; form-action 'none'; ` +
-      "frame-src 'none'; object-src 'none'; base-uri 'none'"
+      `frame-src 'none'; object-src 'none'; base-uri ${liveBase}`
     : `default-src 'none'; img-src ${bridgeOrigin} data:; ` +
       `style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; form-action 'none'; ` +
       "frame-src 'none'; object-src 'none'; base-uri 'none'"

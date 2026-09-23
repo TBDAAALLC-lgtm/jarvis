@@ -421,7 +421,7 @@ export default function App() {
           const grid = camera.recentGrid(req.seconds, 9)
           return grid ?? { error: 'There is not enough recent footage to review.' }
         }
-        return await camera.watchAhead(req.seconds, 9)
+        return await camera.watchAhead(req.seconds, 9, req.signal)
       } catch (err) {
         return {
           error:

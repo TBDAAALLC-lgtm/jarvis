@@ -248,6 +248,7 @@ function sample<T>(items: T[], want: number): T[] {
 export async function watchAhead(
   seconds: number,
   frames: number,
+  signal?: AbortSignal,
 ): Promise<{ data: string; mimeType: string }> {
   if (!video?.videoWidth) throw new Error('the camera is not ready')
   const shots: Shot[] = []
@@ -255,14 +256,42 @@ export async function watchAhead(
   const gap = (seconds * 1000) / Math.max(1, frames - 1)
 
   for (let i = 0; i < frames; i++) {
+    /**
+     * Stop the moment the user says stop.
+     *
+     * This is the deepest point an interrupt has to reach, and until it did,
+     * every link above it was theatre: the bridge rejected its promise and
+     * unwound the turn while this loop kept sampling for the rest of the
+     * countdown, camera light on, indicator up. Fifteen seconds is a long time
+     * to keep filming someone who has asked you not to.
+     *
+     * Throwing rather than returning what it has. A partial clip is not what
+     * was asked for, and the caller has already been told the turn is over, so
+     * handing frames back now would only put them somewhere nobody is looking.
+     */
+    if (signal?.aborted) throw new Error('the user interrupted')
+
     const cell = document.createElement('canvas')
     if (drawTo(cell, CELL_W, CELL_H)) {
       shots.push({ at: performance.now(), bitmap: cell })
     }
-    if (i < frames - 1) await new Promise((r) => setTimeout(r, gap))
+    if (i < frames - 1) await sleep(gap, signal)
   }
   if (!shots.length) throw new Error('no frames were captured')
   return contactSheet(shots, started)
+}
+
+/** A gap between frames that an interrupt can cut short. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', finish)
+      resolve()
+    }
+    const timer = setTimeout(finish, ms)
+    signal?.addEventListener('abort', finish, { once: true })
+  })
 }
 
 /**

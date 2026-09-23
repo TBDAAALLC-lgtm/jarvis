@@ -75,8 +75,23 @@ export type CaptureRequest = {
   seconds: number
   /** 'now' records forward; 'past' reads the rolling buffer. */
   when: 'now' | 'past'
+  /**
+   * Aborted when the bridge says the turn was called off.
+   *
+   * A `watch` holds the camera for up to fifteen seconds. Barge-in used to
+   * reach only as far as the bridge — the turn unwound there while over here
+   * the capture ran to the end, hardware light on, indicator up. The user said
+   * stop and the camera kept going for the rest of the countdown.
+   *
+   * The bridge now sends a `cancel` frame naming the request, and this is how
+   * it arrives.
+   */
+  signal: AbortSignal
 }
 export type CaptureResult = { data?: string; mimeType?: string; error?: string }
+
+/** Captures in flight, by the id the bridge gave them, so `cancel` can find one. */
+const captures = new Map<string, AbortController>()
 
 let onCapture: ((req: CaptureRequest) => Promise<CaptureResult>) | null = null
 export function watchCapture(fn: (req: CaptureRequest) => Promise<CaptureResult>) {
@@ -194,15 +209,37 @@ function dispatch(ws: WebSocket) {
         // Always answers, even on failure: the bridge is holding a turn open
         // waiting for this, and a rejection that never arrives is a turn that
         // hangs until the idle timer notices.
+        // Held so a later `cancel` naming this id can reach the capture that
+        // is still running. Dropped on settle either way, so a long session of
+        // camera calls does not accumulate controllers.
+        const ac = new AbortController()
+        captures.set(id, ac)
+        const done = (payload: Record<string, unknown>) => {
+          captures.delete(id)
+          reply(payload)
+        }
+
         onCapture({
           mode: msg.mode === 'watch' ? 'watch' : 'look',
           reason: msg.reason ?? '',
           seconds: Math.max(2, Math.min(15, Number(msg.seconds) || 6)),
           when: msg.when === 'past' ? 'past' : 'now',
+          signal: ac.signal,
         })
-          .then(reply)
-          .catch((err) => reply({ error: String(err?.message ?? err) }))
+          .then(done)
+          .catch((err) => done({ error: String(err?.message ?? err) }))
       }
+    } else if (msg.type === 'cancel' && msg.id) {
+      /**
+       * The turn was called off; stop what it started.
+       *
+       * The bridge has already rejected its side, so nothing is waiting for an
+       * answer — this exists purely so the camera stops recording and the
+       * indicator comes down at the moment the user asked, rather than whenever
+       * the countdown happened to end.
+       */
+      captures.get(msg.id)?.abort()
+      captures.delete(msg.id)
     } else if (msg.type === 'ui' && msg.op) {
       // A `ui` frame with no args is normal — reset and clear take none — so an
       // absent args object is an empty one, not a reason to drop the command.

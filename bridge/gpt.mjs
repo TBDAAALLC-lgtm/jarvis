@@ -219,7 +219,12 @@ export async function runTurn({
         }
       }
 
-      const out = malformed ?? (await callTool(registry, call.name, args, { decide, refusal }))
+      const out =
+        malformed ??
+        // The turn's own signal goes with it. Checking `aborted` between calls
+        // only abandons work that has not started; this is what reaches the
+        // call already running — the one the user actually interrupted.
+        (await callTool(registry, call.name, args, { decide, refusal, signal }))
       onToolResult?.(call.name, out.isError)
 
       history.push({ role: 'tool', tool_call_id: call.id, content: clip(out.text) })
