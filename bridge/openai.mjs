@@ -181,30 +181,55 @@ export async function streamChat({
   const key = openaiKey()
   if (!key) throw new Error('no OPENAI_API_KEY')
 
-  const model = await resolveModel(signal)
+  /**
+   * The abort contract has to cover the request, not just the response.
+   *
+   * The header above promises that an abort resolves rather than throws, and
+   * that promise used to be kept only once the body loop had started — the
+   * model lookup and the POST sat outside any handler, so a barge-in during the
+   * request window rejected out of here, past runTurn, and surfaced as an error
+   * frame reading "This operation was aborted" instead of the silent stop every
+   * other barge-in produces.
+   *
+   * Tools widened that window from once per turn to once per round: after a
+   * page read comes back, the next round re-posts the whole transcript, and the
+   * user cutting in during that POST is an ordinary thing to do. So the window
+   * is covered here, and an abort is a resolution on every path out of this
+   * function rather than on most of them.
+   */
+  let model
+  let res
+  try {
+    model = await resolveModel(signal)
 
-  const res = await fetch(`${API}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${key}`,
-      'content-type': 'application/json',
-    },
-    // `tools: []` is not the same as no tools — some models reject an empty
-    // array — so the key is omitted entirely rather than sent empty.
-    body: JSON.stringify({
-      model,
-      messages,
-      stream: true,
-      ...(tools?.length
-        ? {
-            tools,
-            tool_choice: 'auto',
-            ...(noReasoningWithTools.has(model) ? { reasoning_effort: 'none' } : {}),
-          }
-        : {}),
-    }),
-    signal,
-  })
+    res = await fetch(`${API}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${key}`,
+        'content-type': 'application/json',
+      },
+      // `tools: []` is not the same as no tools — some models reject an empty
+      // array — so the key is omitted entirely rather than sent empty.
+      body: JSON.stringify({
+        model,
+        messages,
+        stream: true,
+        ...(tools?.length
+          ? {
+              tools,
+              tool_choice: 'auto',
+              ...(noReasoningWithTools.has(model) ? { reasoning_effort: 'none' } : {}),
+            }
+          : {}),
+      }),
+      signal,
+    })
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      return { text: '', model: model ?? null, aborted: true, toolCalls: [], finishReason: null }
+    }
+    throw err
+  }
 
   if (!res.ok || !res.body) {
     // Pass the upstream wording through. "model not found", "insufficient

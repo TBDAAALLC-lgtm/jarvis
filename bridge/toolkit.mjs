@@ -177,6 +177,44 @@ export function flatten(result) {
 }
 
 /**
+ * The schema, as something that can actually reject an argument.
+ *
+ * On the Claude path the SDK parses arguments against the tool's shape before
+ * the handler ever sees them. Every handler in this bridge was written knowing
+ * that, and two things follow from it that are easy to miss when a second
+ * caller appears.
+ *
+ * The small one is that `.default()` and `.catch()` — used heavily here,
+ * deliberately, so a coordinate arriving as a string does not break a turn the
+ * user is watching — only do anything during a parse. Skip it and every one of
+ * those defences is decoration.
+ *
+ * The large one is that a Zod object STRIPS keys it does not declare, and
+ * several handlers are built on exactly that. `chrome_screenshot` is
+ * `forward('computer')({ action: 'screenshot', ...args })`: the `action` is
+ * meant to be fixed, and what stops a caller supplying their own is not the
+ * spread order but the parse that removed it two steps earlier. Hand a raw
+ * argument object straight to that handler and a screenshot — which is
+ * permitted in read-only mode, being a read — becomes `left_click` at a
+ * coordinate of the caller's choosing in the user's signed-in browser.
+ *
+ * So arguments are parsed here too, from the same shape, before any handler
+ * runs. This is the concrete form of the promise the header makes: not that the
+ * gate is shared, but that everything standing between a model and the machine
+ * is.
+ */
+const parsers = new WeakMap()
+
+function parserFor(spec) {
+  let parser = parsers.get(spec)
+  if (!parser) {
+    parser = z.object(spec.inputSchema ?? {})
+    parsers.set(spec, parser)
+  }
+  return parser
+}
+
+/**
  * Run one tool by its full name.
  *
  * The gate is the caller's — `decide` is passed in rather than imported, so
@@ -198,8 +236,23 @@ export async function callTool(reg, name, args, { decide, refusal }) {
     return { text: refusal, images: [], isError: true }
   }
 
+  const parsed = parserFor(spec).safeParse(args ?? {})
+  if (!parsed.success) {
+    // Handed back rather than repaired. Most fields here carry `.catch()`, so
+    // reaching this at all means something structural is wrong, and guessing
+    // at what was meant is how a tool runs against the wrong thing.
+    const why = parsed.error.issues
+      .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
+      .join('; ')
+    return {
+      text: `Those arguments were rejected — ${why}. Call it again with arguments that fit the schema.`,
+      images: [],
+      isError: true,
+    }
+  }
+
   try {
-    return flatten(await spec.handler(args ?? {}, {}))
+    return flatten(await spec.handler(parsed.data, {}))
   } catch (err) {
     return {
       text: `The tool failed: ${err?.message ?? err}`,

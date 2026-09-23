@@ -29,7 +29,7 @@ import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
 import { probeUrl, renderPage } from './page.mjs'
 import { openaiKey } from './openai.mjs'
-import { runTurn, trim } from './gpt.mjs'
+import { forgetImages, runTurn, trim } from './gpt.mjs'
 
 const PORT = Number(process.env.JARVIS_BRIDGE_PORT ?? 8787)
 
@@ -728,6 +728,28 @@ const MEDIA_TIMEOUT_MS = 30_000
  * an attacker's HTML from the bridge's own origin — the one origin allowed to
  * open the agent socket — which is the same reason IMAGE_TYPES has no .svg.
  */
+/**
+ * Types that satisfy the `kinds` prefix and must be refused anyway.
+ *
+ * IMAGE_TYPES above already leaves `.svg` out, and says why: an SVG is a
+ * scriptable document. That rule guards the local /file endpoint, which decides
+ * by extension. This endpoint decides by the *origin's* content-type against a
+ * prefix, and `image/svg+xml` starts with `image/`, so a remote SVG walked
+ * straight through the check written to stop exactly this.
+ *
+ * It matters because of where the bytes come back from. The proxy exists so the
+ * page never talks to the wider web — everything is re-served from
+ * localhost:8787 — and index.html's frame-src trusts that origin so blades can
+ * show a fetched article. An SVG served from there and framed is script running
+ * on the bridge's own origin, with reach over every other thing it serves. A
+ * remote page needs only to answer /img with an SVG, and the renderer rewrites
+ * panel image URLs to this endpoint for it.
+ *
+ * Kept as exact types rather than a prefix, so the next scriptable format has
+ * to be considered rather than silently matching a pattern.
+ */
+const NEVER_PROXIED = new Set(['image/svg+xml', 'image/svg-xml', 'image/svg'])
+
 async function proxyRemote(req, res, cors, { kinds, maxBytes, timeoutMs, ranged }) {
   const asked = new URL(req.url, 'http://x').searchParams.get('url') ?? ''
   const target = vetTarget(asked)
@@ -760,6 +782,10 @@ async function proxyRemote(req, res, cors, { kinds, maxBytes, timeoutMs, ranged 
   if (!kinds.some((kind) => type.startsWith(kind))) {
     upstream.resume()
     throw proxyError(415, `not ${kinds.join(' or ')} (got ${type || 'nothing'})`)
+  }
+  if (NEVER_PROXIED.has(type)) {
+    upstream.resume()
+    throw proxyError(415, `${type} is not served from this origin`)
   }
 
   const declared = Number(upstream.headers['content-length'])
@@ -1279,9 +1305,27 @@ wss.on('connection', (socket) => {
    * id the client sent lets it ignore anything that is not its own, which is
    * the only reliable fix: no amount of waiting on this side changes what a
    * listener over there has already heard.
+   *
+   * One slot was not enough once there were two brains.
+   *
+   * It used to be a single `answering` that both providers wrote. That works
+   * while only one of them can be mid-turn, and the two are not as separate as
+   * they look: an interrupt waits at most SETTLE_CAP_MS for the abandoned turn
+   * to report, and a Claude turn stopped inside an MCP call does not report
+   * that fast. So the queued question runs, the new id is written, and then the
+   * old turn's `result` arrives and is stamped with it. The browser's listener
+   * accepts it, because the tag is the only thing it checks — and a question
+   * asked of GPT is answered with the tail of Claude's abandoned turn, while
+   * GPT's real answer streams to a listener that has already been torn down.
+   *
+   * A tag whose whole purpose is to say which turn a frame belongs to cannot
+   * live in a variable the next turn overwrites. So each path carries its own:
+   * the pump stamps `claudeTurn`, and a GPT turn closes over the id it was
+   * called with and never consults anything shared. A frame from an abandoned
+   * turn now arrives wearing the id it was born with, and the client drops it.
    */
-  let answering = null
-  const sendTurn = (msg) => send({ ...msg, ask: answering })
+  let claudeTurn = null
+  const sendClaude = (msg) => send({ ...msg, ask: claudeTurn })
 
   /**
    * Asking the browser for something and waiting for the answer.
@@ -1365,7 +1409,7 @@ wss.on('connection', (socket) => {
    */
   const SETTLE_CAP_MS = 400
 
-  const announceTool = (id, name) => {
+  const announceTool = (id, name, emit = sendClaude) => {
     if (!name || (id && seenTools.has(id))) return
     if (id) seenTools.add(id)
     // The display tool isn't work being done, it's the HUD drawing itself —
@@ -1376,7 +1420,7 @@ wss.on('connection', (socket) => {
     // interface is the interface talking about itself, not work being done for
     // the user, and the badge would be describing the very thing they can see.
     if (name.startsWith('mcp__jarvis_ui__')) return
-    if (decideTool(name)) return sendTurn({ type: 'tool', name })
+    if (decideTool(name)) return emit({ type: 'tool', name })
     if (id) heldTools.set(id, name)
   }
 
@@ -1384,7 +1428,7 @@ wss.on('connection', (socket) => {
     const name = heldTools.get(id)
     if (name === undefined) return
     heldTools.delete(id)
-    if (!failed) sendTurn({ type: 'tool', name })
+    if (!failed) sendClaude({ type: 'tool', name })
   }
 
   /**
@@ -1501,7 +1545,7 @@ wss.on('connection', (socket) => {
               ev.delta?.type === 'text_delta' &&
               ev.delta.text
             ) {
-              sendTurn({ type: 'text', delta: ev.delta.text })
+              sendClaude({ type: 'text', delta: ev.delta.text })
             }
             if (
               ev?.type === 'content_block_start' &&
@@ -1555,14 +1599,14 @@ wss.on('connection', (socket) => {
                   '[jarvis] auth failure arrived as a result:',
                   body,
                 )
-                sendTurn({ type: 'error', message: body })
+                sendClaude({ type: 'error', message: body })
                 finishTurn?.()
                 finishTurn = null
                 seenTools.clear()
                 heldTools.clear()
                 break
               }
-              sendTurn({
+              sendClaude({
                 type: 'done',
                 text: body,
                 costUsd: msg.total_cost_usd ?? null,
@@ -1572,7 +1616,7 @@ wss.on('connection', (socket) => {
                 `[jarvis] turn failed: ${msg.subtype}`,
                 msg.errors ?? '',
               )
-              sendTurn({
+              sendClaude({
                 type: 'error',
                 message: RESULT_FAILURES[msg.subtype] ?? RESULT_FAILURES.default,
               })
@@ -1600,19 +1644,57 @@ wss.on('connection', (socket) => {
             break
         }
       }
+      /**
+       * The loop ended without throwing, which is the quieter half of the
+       * same failure.
+       *
+       * The `catch` below was written for a session that dies loudly, and it
+       * does the right thing. But an async iterator can also simply finish —
+       * the CLI exits, the transport closes, the SDK decides it is done — and
+       * then `for await` returns normally, this function resolves, and nothing
+       * else happens. No error is logged, no frame is sent, the socket stays
+       * open, and the client goes on believing it has a working bridge.
+       *
+       * Every later Claude question is then pushed into `inbox` or handed to a
+       * `deliver` nobody is waiting on, and hangs until the client's idle timer
+       * gives up two minutes later. From the chair that is JARVIS-CLAUDE
+       * answering nothing, for ever, with nothing anywhere saying why — this
+       * project's defining bug, reached by the one path that leaves no trace.
+       *
+       * So a clean end is handled exactly like a dirty one, because to the
+       * person waiting they are the same event.
+       */
+      console.error('[jarvis] session stream ended')
+      sendClaude({
+        type: 'error',
+        message: 'The connection to Claude ended. Reconnecting.',
+      })
+      stopSession()
     } catch (err) {
       console.error('[jarvis] session error:', err)
       send({ type: 'error', message: String(err?.message ?? err) })
-      // The stream is finished either way — nothing will ever be read from it
-      // again. Leaving the socket open would leave the client believing it has
-      // a working bridge, and every later question would hang for ever waiting
-      // on a pump that has already stopped. Close it so it reconnects.
-      closed = true
-      deliver?.(null)
-      session.close?.()
-      socket.close()
+      stopSession()
     }
   })()
+
+  /**
+   * Nothing will ever be read from the stream again.
+   *
+   * Leaving the socket open would leave the client believing it has a working
+   * bridge, and every later question would hang for ever waiting on a pump that
+   * has already stopped. Close it so it reconnects.
+   */
+  function stopSession() {
+    closed = true
+    deliver?.(null)
+    // Anything waiting on this turn is never going to be told it finished by
+    // the stream, because the stream is gone. Release it here or the next
+    // question sits behind the settle cap for a turn that cannot end.
+    finishTurn?.()
+    finishTurn = null
+    session.close?.()
+    socket.close()
+  }
 
   /**
    * GPT keeps its own history.
@@ -1641,11 +1723,32 @@ wss.on('connection', (socket) => {
   let gptAbort = null
 
   async function answerWithGpt(text, id) {
-    answering = id
+    // Closed over, not stored. This is the whole point of splitting the tag:
+    // every frame this turn emits carries the id this turn was asked with, and
+    // nothing a later turn does can reach back and change it.
+    const sendGpt = (msg) => send({ ...msg, ask: id })
+
+    // Last turn's camera frames go here, at the boundary where they stop being
+    // something the model is still looking at and become something it has
+    // already described. See forgetImages: they are megabytes, and every
+    // question from here on would carry them again.
+    forgetImages(gptHistory)
     gptHistory.push({ role: 'user', content: text })
     gptHistory = trim(gptHistory, GPT_HISTORY_MESSAGES)
 
-    gptAbort = new AbortController()
+    /**
+     * Held locally as well as shared, so this turn only ever disarms itself.
+     *
+     * `gptAbort` is one slot and `answerWithGpt` is re-entrant: an interrupt
+     * waits at most SETTLE_CAP_MS, so when turn N is slow the queued turn N+1
+     * starts while N is still unwinding. N's `finally` then runs second and
+     * blanks the slot — which by that point holds N+1's controller. The live
+     * turn is left with nothing to abort it, so every barge-in for the rest of
+     * that turn does nothing at all and the user keeps talking over an
+     * assistant that will not stop.
+     */
+    const abort = new AbortController()
+    gptAbort = abort
     try {
       const { text: full, aborted } = await runTurn({
         system: `${SYSTEM_PROMPT}\n\n${addressBlock()}`,
@@ -1658,24 +1761,25 @@ wss.on('connection', (socket) => {
         // policy itself, called from a second place.
         decide: decideTool,
         refusal: WRITE_REFUSAL,
-        signal: gptAbort.signal,
-        onDelta: (delta) => sendTurn({ type: 'text', delta }),
+        signal: abort.signal,
+        onDelta: (delta) => sendGpt({ type: 'text', delta }),
         // No tool id, because a chat completion has no equivalent of the SDK's
         // two sightings of the same block — each call is announced once, by the
         // one place that sees it. announceTool still decides what is worth
         // showing, so the HUD's rules stay in a single place for both brains.
-        onTool: (name) => announceTool(null, name),
+        onTool: (name) => announceTool(null, name, sendGpt),
       })
-      if (!aborted) sendTurn({ type: 'done', text: full, costUsd: null })
+      if (!aborted) sendGpt({ type: 'done', text: full, costUsd: null })
     } catch (err) {
       // Straight to the screen as an error frame, never as answer text.
       // A failure dressed as an answer is the bug that made this whole
       // app look mute, and it is not being reproduced here.
       const message = String(err?.message ?? err)
       console.error('[jarvis] gpt turn failed:', message)
-      sendTurn({ type: 'error', message })
+      sendGpt({ type: 'error', message })
     } finally {
-      gptAbort = null
+      // Only if it is still ours; see above.
+      if (gptAbort === abort) gptAbort = null
       // The interrupt handshake waits on this. An OpenAI turn produces no
       // SDK 'result' message, so nothing else would ever release it and
       // the next question would sit behind the settle cap for nothing.
@@ -1714,7 +1818,7 @@ wss.on('connection', (socket) => {
           void answerWithGpt(text, id)
           return
         }
-        answering = id
+        claudeTurn = id
         if (deliver) {
           const resolve = deliver
           deliver = null
@@ -1755,6 +1859,14 @@ wss.on('connection', (socket) => {
     console.log('[jarvis] client disconnected')
     closed = true
     deliver?.(null)
+    // The Claude session is closed here and the OpenAI request was not, which
+    // is a difference with a bill attached: a completion nobody is listening to
+    // keeps generating to its natural end, and every token of it is charged for
+    // and then dropped on the floor when `send` finds the socket shut. With
+    // tools it can also still be mid-round, so the next round would fire off a
+    // fresh request for a page nobody is going to see. Closing the tab should
+    // stop the work, on both brains.
+    gptAbort?.abort()
     session.close?.()
   })
 })

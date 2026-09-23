@@ -84,6 +84,34 @@ export function trim(history, maxMessages) {
   return []
 }
 
+/**
+ * Let go of camera frames once the turn that took them is over.
+ *
+ * A frame enters the transcript as a base64 data URL — a few hundred kilobytes
+ * for `look`, over a megabyte for `watch`, which returns a grid of them. `clip`
+ * bounds tool *text* and does nothing for this, so without a rule of its own
+ * every frame stays until it falls out of the 60-message window, and every
+ * question after it re-uploads the lot and is billed for looking at them again.
+ * Three camera calls in a session and an ordinary spoken question is carrying
+ * several megabytes it has no use for. Eventually the request exceeds the
+ * model's limit and the turn fails, and keeps failing.
+ *
+ * The turn boundary is the honest place to let go: within a turn the model is
+ * still reasoning about what it just saw, and afterwards it has already said
+ * what it saw and that sentence is in the transcript. The message stays in
+ * place, so the trim above still sees the same shape — only the pixels go.
+ */
+export function forgetImages(history) {
+  for (const m of history) {
+    if (m.role !== 'user' || !Array.isArray(m.content)) continue
+    if (!m.content.some((part) => part?.type === 'image_url')) continue
+    m.content = [
+      { type: 'text', text: '[a camera frame was here; it is no longer attached]' },
+    ]
+  }
+  return history
+}
+
 /** Images cannot ride in a `tool` message, so they follow in a `user` one. */
 const imageMessage = (images) => ({
   role: 'user',
@@ -163,10 +191,16 @@ export async function runTurn({
     })
 
     const images = []
-    for (const call of res.toolCalls) {
+    let cutAt = -1
+
+    for (let i = 0; i < res.toolCalls.length; i++) {
+      const call = res.toolCalls[i]
       // Between calls, not only before the batch: a model can ask for four
       // things at once and the user can cut in during the second.
-      if (signal?.aborted) return { text: spoken, aborted: true }
+      if (signal?.aborted) {
+        cutAt = i
+        break
+      }
 
       let args = {}
       let malformed = null
@@ -190,6 +224,34 @@ export async function runTurn({
 
       history.push({ role: 'tool', tool_call_id: call.id, content: clip(out.text) })
       images.push(...out.images)
+    }
+
+    /**
+     * An interrupt must not leave the block half-answered.
+     *
+     * The assistant message declaring the calls is already in the transcript —
+     * it has to be, it is what the results attach to — so returning here with
+     * calls unanswered leaves an assistant message promising N results next to
+     * fewer than N. OpenAI rejects that transcript outright, and since the
+     * transcript is the session's memory, it rejects it again on every question
+     * after this one: JARVIS-GPT goes permanently mute for the life of the
+     * socket while JARVIS-CLAUDE carries on, and only a reload clears it.
+     *
+     * The same failure the trim above was written to prevent, reached through
+     * the abort path instead. So the block is closed before leaving: every call
+     * that did not run gets a result saying so, which is also true, and which
+     * the model can read on the next question instead of guessing why its tools
+     * seem to have half-happened.
+     */
+    if (cutAt >= 0) {
+      for (let i = cutAt; i < res.toolCalls.length; i++) {
+        history.push({
+          role: 'tool',
+          tool_call_id: res.toolCalls[i].id,
+          content: 'Not run — the user interrupted.',
+        })
+      }
+      return { text: spoken, aborted: true }
     }
 
     if (images.length) history.push(imageMessage(images))

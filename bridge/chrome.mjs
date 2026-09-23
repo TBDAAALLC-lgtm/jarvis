@@ -667,7 +667,12 @@ export function chromeKit({ allowWrites }) {
         'answer is visual, or when the user asks what something looks like — ' +
         'and put the result on the display rather than describing it.',
       { tabId },
-      async (args) => forward('computer')({ action: 'screenshot', ...args }),
+      // `action` after the spread, not before it. The schema strips an `action`
+      // a caller supplies, so this is the second lock rather than the only one
+      // — but a screenshot is a read and runs in read-only mode, so if the
+      // first lock ever slipped, the tool that escalated to `left_click` in the
+      // user's signed-in browser would be this one.
+      async (args) => forward('computer')({ ...args, action: 'screenshot' }),
     ),
 
     tool(
@@ -741,21 +746,21 @@ export function chromeKit({ allowWrites }) {
             .describe('[x, y] fallback when there is no ref.'),
           tabId,
         },
-        async (args) => forward('computer')({ action: 'left_click', ...args }),
+        async (args) => forward('computer')({ ...args, action: 'left_click' }),
       ),
 
       tool(
         'chrome_type',
         'Type text into whatever is focused. Click the field first.',
         { text: z.string(), tabId },
-        async (args) => forward('computer')({ action: 'type', ...args }),
+        async (args) => forward('computer')({ ...args, action: 'type' }),
       ),
 
       tool(
         'chrome_key',
         'Press a key or chord, e.g. "Return", "Escape", "cmd+a".',
         { text: z.string().describe('The key to press.'), tabId },
-        async (args) => forward('computer')({ action: 'key', ...args }),
+        async (args) => forward('computer')({ ...args, action: 'key' }),
       ),
 
       tool(
