@@ -17,17 +17,19 @@
 
 import { WebSocketServer } from 'ws'
 import { query } from '@anthropic-ai/claude-agent-sdk'
-import { displayServer } from './panels.mjs'
-import { uiServer } from './ui.mjs'
-import { chromeAvailable, chromeServer } from './chrome.mjs'
-import { visionServer } from './vision.mjs'
+import { displayKit } from './panels.mjs'
+import { uiKit } from './ui.mjs'
+import { chromeAvailable, chromeKit } from './chrome.mjs'
+import { visionKit } from './vision.mjs'
+import { registry } from './toolkit.mjs'
 import { homedir, tmpdir } from 'node:os'
 import { readFileSync, realpathSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
 import { probeUrl, renderPage } from './page.mjs'
-import { openaiKey, streamChat } from './openai.mjs'
+import { openaiKey } from './openai.mjs'
+import { runTurn, trim } from './gpt.mjs'
 
 const PORT = Number(process.env.JARVIS_BRIDGE_PORT ?? 8787)
 
@@ -298,6 +300,24 @@ function decideTool(name) {
   }
   return ALLOW_WRITES
 }
+
+/**
+ * What a refused tool is told, whichever brain asked.
+ *
+ * Named rather than written twice, because the two paths refuse through
+ * different machinery — the SDK's `canUseTool` on one side, `callTool` on the
+ * other — and a model's behaviour after a refusal is shaped almost entirely by
+ * this sentence. Two wordings would mean two assistants handling the same
+ * refusal differently, which is exactly the divergence the shared registry
+ * exists to prevent.
+ *
+ * Every word of it can end up spoken, so it carries no command to read out:
+ * the persona is forbidden from saying one aloud.
+ */
+const WRITE_REFUSAL =
+  'Blocked: JARVIS is running in read-only mode and cannot take actions that' +
+  ' change anything. Tell the user this action is unavailable until they' +
+  ' enable write access on the machine.'
 
 const SYSTEM_PROMPT = `You are JARVIS. You are speaking out loud to one person, and you do not
 defer to them.
@@ -1367,30 +1387,42 @@ wss.on('connection', (socket) => {
     if (!failed) sendTurn({ type: 'tool', name })
   }
 
+  /**
+   * The tools this bridge builds itself, defined once for both brains.
+   *
+   * Built here rather than at module scope because three of the four close over
+   * this socket: a `display` call has to land on *this* screen, and the camera
+   * has to ask *this* browser. Built before the session rather than inside it
+   * so the same objects can be handed to the Agent SDK as MCP servers and to
+   * the GPT path as a registry — one construction, one set of handlers, and no
+   * way for the two brains to be holding different tools.
+   */
+  const kits = [
+    displayKit(
+      (panel) => send({ type: 'panel', panel }),
+      (blade) => send({ type: 'blade', blade }),
+    ),
+    uiKit((op, args) => send({ type: 'ui', op, args })),
+    // The browser server gates itself at construction: chromeKit only builds
+    // the acting tools when ALLOW_WRITES is set, so in read-only mode those
+    // tools are absent from both brains rather than present and refused.
+    chromeKit({ allowWrites: ALLOW_WRITES }),
+    visionKit(ask),
+  ]
+
+  /** The same tools, under the same names, for whichever brain is answering. */
+  const gptTools = registry(kits)
+
   const session = query({
     prompt: userMessages(),
     options: {
-      // Everything Claude Code has configured, plus the HUD as an in-process
-      // server. The HUD's handler closes over this socket, so a `display` call
-      // lands on screen directly — which is also why this object is built per
-      // connection rather than once.
+      // Everything Claude Code has configured, plus the kits above. Each kit
+      // carries its own name, so the key and the name it is announced under
+      // cannot disagree — the key matters because MCP tool names are
+      // `mcp__<key>__<tool>`, which is what decideTool and announceTool read.
       mcpServers: {
         ...MCP_SERVERS,
-        jarvis: displayServer(
-          (panel) => send({ type: 'panel', panel }),
-          (blade) => send({ type: 'blade', blade }),
-        ),
-        // The interface controls, on the same socket. A separate key because
-        // MCP tool names are `mcp__<key>__<tool>` and one key can only carry
-        // one server; the underscore in it is why decideTool and announceTool
-        // both name `jarvis_ui` explicitly.
-        jarvis_ui: uiServer((op, args) => send({ type: 'ui', op, args })),
-        // The user's own Chrome, over the extension's native-host socket. It
-        // holds no per-connection state, but it is built here with the rest so
-        // the write gate is read once, at the same point as everything else.
-        jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }),
-        // The camera, which unlike everything else here has to ask and wait.
-        jarvis_eyes: visionServer(ask),
+        ...Object.fromEntries(kits.map((kit) => [kit.name, kit.server])),
       },
       // A plain system prompt, not the claude_code preset. The preset is
       // tuned for a coding agent — verbose, file-oriented, and a large chunk
@@ -1443,15 +1475,7 @@ wss.on('connection', (socket) => {
         console.log(`[jarvis] tool ${toolName} -> ${ok ? 'allow' : 'deny'}`)
         return ok
           ? { behavior: 'allow' }
-          : {
-              behavior: 'deny',
-              // Every word of this can end up spoken, so it carries no command
-              // to read out — the persona is forbidden from saying one aloud.
-              message:
-                'Blocked: JARVIS is running in read-only mode and cannot take' +
-                ' actions that change anything. Tell the user this action is' +
-                ' unavailable until they enable write access on the machine.',
-            }
+          : { behavior: 'deny', message: WRITE_REFUSAL }
       },
     },
   })
@@ -1601,27 +1625,47 @@ wss.on('connection', (socket) => {
    * Capped because a voice session has no natural end and every turn
    * resends the whole transcript: unbounded, the price of one question
    * grows with how long the window has been open.
+   *
+   * The cap is applied by `trim` rather than by shifting off the front, and
+   * that is not a refinement — it is required now that tools are in play. A
+   * `tool` message is only legal directly after the `assistant` message whose
+   * call it answers, so a blind shift can leave an orphan that OpenAI rejects
+   * outright, turning every later question in the session into a 400 for a
+   * reason nothing on screen would connect to the history cap.
+   *
+   * Counted in messages, not turns, because a single question can now add half
+   * a dozen: the answer, its tool calls, and a result for each of them.
    */
-  const gptHistory = []
-  const GPT_HISTORY_TURNS = 24
+  let gptHistory = []
+  const GPT_HISTORY_MESSAGES = 60
   let gptAbort = null
 
   async function answerWithGpt(text, id) {
     answering = id
     gptHistory.push({ role: 'user', content: text })
-    while (gptHistory.length > GPT_HISTORY_TURNS * 2) gptHistory.shift()
+    gptHistory = trim(gptHistory, GPT_HISTORY_MESSAGES)
 
     gptAbort = new AbortController()
     try {
-      const { text: full, aborted } = await streamChat({
-        messages: [
-          { role: 'system', content: `${SYSTEM_PROMPT}\n\n${addressBlock()}` },
-          ...gptHistory,
-        ],
+      const { text: full, aborted } = await runTurn({
+        system: `${SYSTEM_PROMPT}\n\n${addressBlock()}`,
+        // Mutated in place as the turn runs, so an interrupt leaves a truthful
+        // record of how far it got rather than discarding the whole exchange.
+        history: gptHistory,
+        registry: gptTools,
+        // The identical gate the Agent SDK consults, asked the identical
+        // question about the identical name. Not a copy of the policy — the
+        // policy itself, called from a second place.
+        decide: decideTool,
+        refusal: WRITE_REFUSAL,
         signal: gptAbort.signal,
         onDelta: (delta) => sendTurn({ type: 'text', delta }),
+        // No tool id, because a chat completion has no equivalent of the SDK's
+        // two sightings of the same block — each call is announced once, by the
+        // one place that sees it. announceTool still decides what is worth
+        // showing, so the HUD's rules stay in a single place for both brains.
+        onTool: (name) => announceTool(null, name),
       })
-      if (full) gptHistory.push({ role: 'assistant', content: full })
       if (!aborted) sendTurn({ type: 'done', text: full, costUsd: null })
     } catch (err) {
       // Straight to the screen as an error frame, never as answer text.

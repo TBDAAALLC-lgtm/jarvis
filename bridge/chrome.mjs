@@ -1,4 +1,5 @@
-import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk'
+import { tool } from '@anthropic-ai/claude-agent-sdk'
+import { defineTools } from './toolkit.mjs'
 import { z } from 'zod'
 import { createConnection } from 'node:net'
 import { readdir, stat } from 'node:fs/promises'
@@ -550,7 +551,7 @@ be clicked. Use chrome_page_text instead when you only want the prose.`
 /**
  * @param {{ allowWrites: boolean }} options
  */
-export function chromeServer({ allowWrites }) {
+export function chromeKit({ allowWrites }) {
   const tools = [
     tool(
       'chrome_status',
@@ -798,7 +799,7 @@ export function chromeServer({ allowWrites }) {
     )
   }
 
-  return createSdkMcpServer({
+  return defineTools({
     name: 'jarvis_chrome',
     version: '1.0.0',
     instructions:
