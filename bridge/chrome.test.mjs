@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises'
 import vm from 'node:vm'
 import { test } from 'node:test'
 import { z } from 'zod'
+import { flatten } from './toolkit.mjs'
 
 const source = (await readFile(new URL('./chrome.mjs', import.meta.url), 'utf8'))
   .replace(/^import .*\r?\n/gm, '')
@@ -116,6 +117,27 @@ test('a notification does not consume or hide an extension permission error', as
   assert.equal(env.timers.size, 0)
 })
 
+for (const [format, failure, expectedText] of [
+  ['MCP content blocks', { isError: true, content: [{ type: 'text', text: 'Permission denied by user' }] }, 'Permission denied by user'],
+  ['legacy text content', { isError: true, content: 'Permission denied by user' }, 'Permission denied by user'],
+  ['fallback result', { isError: true, message: 'Permission denied by user' }, '{"isError":true,"message":"Permission denied by user"}'],
+]) {
+  test(`a nested tool failure stays an error through Chrome and GPT normalization (${format})`, async () => {
+    const env = harness({ onWrite: ({ socket, callback }) => {
+      callback()
+      socket.emit('data', wire({ result: failure }))
+    } })
+    const readPage = env.chromeKit({ allowWrites: false }).specs.find((spec) => spec.name === 'chrome_read_page')
+    const result = await readPage.handler({ tabId: 7 }, {})
+    const gptResult = flatten(result)
+    assert.equal(gptResult.text, expectedText)
+    assert.equal(gptResult.isError, true)
+    assert.equal(result.isError, true)
+    assert.equal(env.writes.length, 1)
+    assert.equal(env.timers.size, 0)
+  })
+}
+
 test('an unrecognized JSON frame leaves the action waiting for a result', async () => {
   const env = harness({ onWrite: ({ socket }) => {
     socket.emit('data', Buffer.concat([wire({ unexpected: true }), wire(reply)]))
@@ -219,6 +241,28 @@ const tabContext = (tabId) => ({ result: { content: [
   { type: 'text', text: JSON.stringify({ availableTabs: [{ tabId }] }) },
 ] } })
 const missingTab = { error: { content: 'No tab available' } }
+
+for (const closed of [false, true]) {
+  test(`close-tab ${closed ? 'clears the target after confirmed success' : 'preserves the target after a permission denial'}`, async () => {
+    let contextCalls = 0
+    const env = harness({ onWrite: ({ socket, message }) => {
+      const response = message.params.tool === 'tabs_context_mcp'
+        ? tabContext(++contextCalls === 1 ? 101 : 202)
+        : message.params.tool === 'tabs_close_mcp' && !closed
+          ? { error: { content: 'Permission denied by user' } } : reply
+      socket.emit('data', wire(response))
+    } })
+    const kit = env.chromeKit({ allowWrites: true })
+    const invoke = (name, args = {}) => kit.specs.find((spec) => spec.name === name).handler(args, {})
+    await invoke('chrome_read_page')
+    const close = await invoke('chrome_close_tab', { tabId: 101 })
+    assert.equal(close.isError === true, !closed)
+    await invoke('chrome_read_page')
+    assert.equal(env.writes.at(-1).params.args.tabId, closed ? 202 : 101)
+    assert.equal(contextCalls, closed ? 2 : 1)
+    assert.equal(env.writes.filter((message) => message.params.tool === 'tabs_close_mcp').length, 1)
+  })
+}
 
 for (const [name, args] of [
   ['chrome_click', { ref: 'ref_1' }],

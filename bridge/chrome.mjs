@@ -379,10 +379,18 @@ function toResult(reply) {
       content: [{ type: 'text', text: typeof detail === 'string' ? detail : JSON.stringify(detail) }],
     }
   }
+  // A reply can be well-formed at the transport layer and still carry a refusal
+  // from the tool itself: `{ result: { isError: true, content } }` is how a
+  // permission denial arrives when the extension answers in MCP's own shape
+  // rather than as `{ error }`. Dropped, it became a successful result carrying
+  // the words "Permission denied" — which the model is free to read as progress.
+  // Only a literal `true` counts, so a malformed `"false"` cannot promote itself
+  // into an authoritative failure.
+  const failed = reply.result?.isError === true ? { isError: true } : null
   const content = reply.result?.content
-  if (Array.isArray(content)) return { content: clean(content) }
-  if (typeof content === 'string') return { content: [{ type: 'text', text: content }] }
-  return { content: [{ type: 'text', text: JSON.stringify(reply.result ?? reply) }] }
+  if (Array.isArray(content)) return { ...failed, content: clean(content) }
+  if (typeof content === 'string') return { ...failed, content: [{ type: 'text', text: content }] }
+  return { ...failed, content: [{ type: 'text', text: JSON.stringify(reply.result ?? reply) }] }
 }
 
 /**
@@ -993,7 +1001,12 @@ export function chromeKit({ allowWrites }) {
         },
         async (args, extra) => {
           const out = await forward('tabs_close_mcp', { needsTab: false })(args, extra)
-          if (isActiveTab(args.tabId)) forgetTab()
+          // Only a confirmed close retires the target. A denied one leaves the
+          // tab open and in front of the user, so forgetting it sent the next
+          // omitted-tab action off to whatever unrelated tab context listed
+          // first — acting on a page nobody asked about, immediately after the
+          // user refused a far smaller thing.
+          if (!out.isError && isActiveTab(args.tabId)) forgetTab()
           return out
         },
       ),
