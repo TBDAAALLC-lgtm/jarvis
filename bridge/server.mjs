@@ -1362,6 +1362,7 @@ wss.on('connection', (socket) => {
    * turn now arrives wearing the id it was born with, and the client drops it.
    */
   let claudeTurn = null
+  let claudeDead = false
   const sendClaude = (msg) => {
     if (claudeTurn) send({ ...msg, ask: claudeTurn.id })
   }
@@ -1469,9 +1470,9 @@ wss.on('connection', (socket) => {
     turn.complete()
   }
 
-  // If cancellation cannot finish within this window, close the session.
-  // Starting another turn would relabel late Claude output or mutate the
-  // same GPT transcript concurrently.
+  // If cancellation cannot finish within this window, retire the affected
+  // provider. Claude owns a separate SDK session; unsettled GPT work requires
+  // closing the socket to prevent concurrent mutation of its transcript.
   const SETTLE_CAP_MS = 400
 
   const announceTool = (id, name, emit = sendClaude) => {
@@ -1593,6 +1594,9 @@ wss.on('connection', (socket) => {
   ;(async () => {
     try {
       for await (const msg of session) {
+        // Closing the SDK may leave buffered events. A retired session never
+        // publishes output or changes readiness for its surviving GPT sibling.
+        if (closed || claudeDead) break
         if (process.env.JARVIS_DEBUG === '1') {
           console.log('[msg]', msg.type, msg.event?.type ?? '')
         }
@@ -1751,8 +1755,6 @@ wss.on('connection', (socket) => {
    * says so; the socket stays up, GPT keeps its history, and the tile is the
    * thing that reports the loss.
    */
-  let claudeDead = false
-
   function stopClaude(message) {
     if (claudeDead || closed) return
     claudeDead = true
@@ -1943,7 +1945,15 @@ wss.on('connection', (socket) => {
     turn.settling = Promise.race([
       turn.finished.then(() => true),
       new Promise((resolve) => { timer = setTimeout(() => resolve(false), SETTLE_CAP_MS) }),
-    ]).finally(() => clearTimeout(timer))
+    ]).then((settled) => {
+      if (!settled && turn.provider === 'claude' && !closed) {
+        // Claude cannot safely accept another question, but its SDK can be
+        // retired without losing the independent GPT transcript on this socket.
+        stopClaude('interruption did not finish before the deadline')
+        return true
+      }
+      return settled
+    }).finally(() => clearTimeout(timer))
 
     if (turn.provider === 'gpt') gptAbort?.abort()
     else void Promise.resolve().then(() => session.interrupt?.()).catch(() => {})

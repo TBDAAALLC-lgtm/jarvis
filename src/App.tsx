@@ -342,6 +342,7 @@ export default function App() {
     // twice, arming two voice loops and two download polls.
     if (booting.current) return
     booting.current = true
+    store.getState().setError(null)
 
     try {
       await ignite()

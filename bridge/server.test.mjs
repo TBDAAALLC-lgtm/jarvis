@@ -19,7 +19,7 @@ const tick = () => new Promise(setImmediate)
 
 // Exercise the real connection handler without starting a server, loading user
 // credentials, running MCP tools, or making model requests.
-function connection({ interrupt = () => Promise.resolve() } = {}) {
+function connection({ interrupt = () => Promise.resolve(), closeEndsStream = true } = {}) {
   const frames = []
   const inputs = []
   const runs = []
@@ -30,6 +30,7 @@ function connection({ interrupt = () => Promise.resolve() } = {}) {
   let capture
   let ended = false
   let interruptCount = 0
+  let sessionCloseCount = 0
   const event = (value) => {
     if (receive) {
       const resolve = receive
@@ -51,6 +52,8 @@ function connection({ interrupt = () => Promise.resolve() } = {}) {
       return interrupt()
     },
     close() {
+      sessionCloseCount++
+      if (!closeEndsStream) return
       if (ended) return
       ended = true
       event(null)
@@ -99,6 +102,7 @@ function connection({ interrupt = () => Promise.resolve() } = {}) {
   return {
     socket, frames, inputs, runs, event, capture,
     get interruptCount() { return interruptCount },
+    get sessionCloseCount() { return sessionCloseCount },
     send: (value) => socket.emit('message', Buffer.from(JSON.stringify(value))),
     async expire(ms = 400) {
       await tick()
@@ -142,7 +146,7 @@ test('a queued question cannot start after its socket closes', async () => {
   assert.equal(h.runs.length, 0)
 })
 
-test('an unsettled Claude turn fails the next request instead of relabeling old output', async () => {
+test('an unsettled Claude turn retires only Claude and never relabels old output', async () => {
   const h = connection()
   h.send(ask('old'))
   await tick()
@@ -152,9 +156,11 @@ test('an unsettled Claude turn fails the next request instead of relabeling old 
   h.event(result('old answer'))
   await tick()
   assert.deepEqual(h.inputs, ['old'])
-  assert.equal(h.socket.readyState, 3)
+  assert.equal(h.socket.readyState, h.socket.OPEN)
+  assert.equal(h.sessionCloseCount, 1)
   assert.ok(h.frames.some((frame) => frame.type === 'error' && frame.ask === 'new'))
   assert.ok(!h.frames.some((frame) => frame.type === 'done' && frame.ask === 'new'))
+  h.socket.close()
 })
 
 test('interrupt acknowledgement cannot bypass the settlement deadline', async () => {
@@ -163,8 +169,61 @@ test('interrupt acknowledgement cannot bypass the settlement deadline', async ()
   await tick()
   h.send(ask('new'))
   await h.expire()
-  assert.equal(h.socket.readyState, 3)
+  assert.equal(h.socket.readyState, h.socket.OPEN)
+  assert.equal(h.sessionCloseCount, 1)
   assert.ok(h.frames.some((frame) => frame.type === 'error' && frame.ask === 'new'))
+  h.socket.close()
+})
+
+test('retiring stuck Claude preserves GPT history and rejects late Claude output', async (t) => {
+  // A close request need not synchronously drain the SDK's buffered events.
+  const h = connection({ closeEndsStream: false })
+  t.after(() => { h.event(null); h.socket.close() })
+  h.send(ask('gpt-seed', 'gpt'))
+  await tick()
+  h.runs[0].options.history.push({ role: 'assistant', content: 'Remembered GPT answer' })
+  h.runs[0].resolve({ text: 'Remembered GPT answer', aborted: false })
+  await tick()
+
+  h.send(ask('claude-stuck'))
+  await tick()
+  h.send(ask('gpt-replacement', 'gpt'))
+  await h.expire()
+  assert.equal(h.socket.readyState, h.socket.OPEN)
+  assert.equal(h.sessionCloseCount, 1)
+  assert.equal(h.runs.length, 2)
+  assert.equal(h.runs[1].options.signal.aborted, false)
+  assert.deepEqual(Array.from(h.runs[1].options.history, (message) => message.content), [
+    'gpt-seed', 'Remembered GPT answer', 'gpt-replacement',
+  ])
+  assert.ok(h.frames.some((frame) => frame.type === 'error' && frame.ask === 'claude-stuck'))
+  assert.ok(!h.frames.some((frame) => frame.type === 'error' && (!frame.ask || frame.ask === 'gpt-replacement')))
+
+  const beforeLateOutput = h.frames.length
+  h.event({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Late Claude text' } } })
+  h.event(result('Late Claude answer'))
+  h.event({ type: 'system', subtype: 'init', mcp_servers: [{ name: 'retired', status: 'connected' }] })
+  await tick()
+  assert.equal(h.frames.length, beforeLateOutput)
+  assert.equal(h.runs[1].options.signal.aborted, false)
+  h.runs[1].options.history.push({ role: 'assistant', content: 'Replacement GPT answer' })
+  h.runs[1].resolve({ text: 'Replacement GPT answer', aborted: false })
+  await tick()
+  assert.ok(h.frames.some((frame) => frame.type === 'done' && frame.ask === 'gpt-replacement' && frame.text === 'Replacement GPT answer'))
+  assert.ok(!h.frames.some((frame) => frame.type === 'done' && frame.text === 'Late Claude answer'))
+
+  h.send(ask('claude-after-retirement'))
+  await tick()
+  assert.equal(h.frames.filter((frame) => frame.type === 'error' && frame.ask === 'claude-after-retirement').length, 1)
+  assert.deepEqual(h.inputs, ['claude-stuck'])
+  h.send(ask('gpt-next', 'gpt'))
+  await tick()
+  assert.equal(h.runs.length, 3)
+  assert.deepEqual(Array.from(h.runs[2].options.history, (message) => message.content), [
+    'gpt-seed', 'Remembered GPT answer', 'gpt-replacement', 'Replacement GPT answer', 'gpt-next',
+  ])
+  h.runs[2].resolve({ text: 'Continued', aborted: false })
+  await tick()
 })
 
 test('completed Claude interruption releases GPT and later asks interrupt the live GPT turn', async () => {

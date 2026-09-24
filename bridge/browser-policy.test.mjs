@@ -151,6 +151,7 @@ const OFF_LIMITS = [
   'MultiEdit',
   'NotebookEdit',
   'KillShell',
+  'TaskStop',
   'mcp__some-server__send_message',
   'mcp__some-server__delete_character',
   'mcp__some-server__create_invoice',
