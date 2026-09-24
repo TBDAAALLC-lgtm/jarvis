@@ -491,24 +491,87 @@ Using tools:
 const AUTH_FAILURE =
   /failed to authenticate|oauth (?:session|token) expired|invalid api key|please run .?claude (?:auth )?login/i
 
+/**
+ * Which account is signed in, for the screen to say out loud.
+ *
+ * The tokens live in one file and the identity behind them in another, and
+ * only the first was ever read. That made the two failures this project
+ * actually hit indistinguishable: signed into the right organisation, and
+ * signed into a personal account that happens to carry a subscription. Both
+ * reported `ready: true, detail: "team"`, and they differed only several turns
+ * later, when a model the organisation has and the individual does not came
+ * back as a 403 reading like anything except a wrong login.
+ *
+ * Read separately from the tokens because the two files fail separately: a
+ * valid login with this file missing is still a valid login, so an absent
+ * account is a blank label rather than a broken brain.
+ */
+function claudeAccount() {
+  try {
+    const cfg = JSON.parse(readFileSync(join(homedir(), '.claude.json'), 'utf8'))
+    const a = cfg.oauthAccount ?? {}
+    if (!a.emailAddress && !a.organizationName) return null
+    return {
+      email: a.emailAddress ?? null,
+      org: a.organizationName ?? null,
+      orgId: a.organizationUuid ?? null,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Whether the Claude side can actually answer, and if it cannot, why.
+ *
+ * Every check here is about a token being *usable*, not merely present, and
+ * that distinction is the whole point. This file sat for weeks holding a
+ * complete, well-formed credential record whose accessToken and refreshToken
+ * were both the empty string; the only reason the old check caught it is that
+ * the expiry beside them had also passed. Had that date been in the future —
+ * which is exactly what a fresh login writes — the tile would have gone green
+ * over two empty strings, and every turn would have failed with the silence
+ * this readiness check exists to prevent.
+ */
 function claudeAuth() {
-  if (process.env.ANTHROPIC_API_KEY) return { ok: true, detail: 'API key' }
+  // Trimmed, because a variable set to whitespace is still set. openaiKey()
+  // has always done this; a key of " " reporting ready was the inconsistency.
+  const key = process.env.ANTHROPIC_API_KEY?.trim()
+  if (key) return { ok: true, detail: 'API key', account: null }
+
+  const account = claudeAccount()
   try {
     const raw = readFileSync(
       join(homedir(), '.claude', '.credentials.json'),
       'utf8',
     )
     const oauth = JSON.parse(raw).claudeAiOauth ?? {}
+
+    // Present and non-empty, in that order. See above.
+    if (!oauth.accessToken?.trim() || !oauth.refreshToken?.trim()) {
+      return { ok: false, detail: 'signed out - run: claude auth login', account }
+    }
+
     const refresh = Number(oauth.refreshTokenExpiresAt ?? 0)
     if (!refresh) {
-      return { ok: false, detail: 'not signed in - run: claude auth login' }
+      return { ok: false, detail: 'not signed in - run: claude auth login', account }
     }
     if (refresh < Date.now()) {
-      return { ok: false, detail: 'login expired - run: claude auth login' }
+      return { ok: false, detail: 'login expired - run: claude auth login', account }
     }
-    return { ok: true, detail: oauth.subscriptionType ?? 'subscription' }
-  } catch {
-    return { ok: false, detail: 'no login found - run: claude auth login' }
+    return { ok: true, detail: oauth.subscriptionType ?? 'subscription', account }
+  } catch (err) {
+    // Distinguished, because they send you to different places: no file means
+    // sign in, an unreadable one means the file is damaged and signing in again
+    // will rewrite it, and neither is helped by being told the other.
+    return {
+      ok: false,
+      detail:
+        err?.code === 'ENOENT'
+          ? 'no login found - run: claude auth login'
+          : 'login file unreadable - run: claude auth login',
+      account,
+    }
   }
 }
 
@@ -788,7 +851,14 @@ const handleRequest = async (req, res) => {
         // show their own state instead of the app inferring it from
         // silence — which is exactly what nobody could do before.
         providers: {
-          claude: { ready: anthropic.ok, detail: anthropic.detail },
+          claude: {
+            ready: anthropic.ok,
+            detail: anthropic.detail,
+            // Which account, not just whether there is one. The recurring
+            // failure here was never "no login" — it was a login to the wrong
+            // place, which looks identical from the outside until it fails.
+            account: anthropic.account,
+          },
           gpt: {
             ready: gptKey,
             detail: gptKey ? 'API key' : 'no OPENAI_API_KEY set',
