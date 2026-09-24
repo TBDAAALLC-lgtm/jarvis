@@ -220,7 +220,9 @@ export async function openRemote(startUrl, headers, timeoutMs) {
     const status = res.statusCode ?? 0
     const location = res.headers.location
     if (status >= 300 && status < 400 && location) {
-      res.resume() // drain, or the socket never returns to the pool
+      // The redirect body is unused and has no size limit. Close this hop
+      // instead of letting it keep downloading while the next one starts.
+      res.destroy()
       if (hop >= MAX_REDIRECTS) throw proxyError(502, 'too many redirects')
       let next
       try {
@@ -265,7 +267,7 @@ export async function fetchText(url, { maxBytes, timeoutMs, accept }) {
     .toLowerCase()
 
   if (status !== 200) {
-    res.resume()
+    res.destroy()
     throw proxyError(status === 404 ? 404 : 502, `upstream said ${status}`)
   }
 

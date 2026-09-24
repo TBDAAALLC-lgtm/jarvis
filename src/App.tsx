@@ -416,6 +416,8 @@ export default function App() {
       try {
         await camera.holdCamera()
         held = true
+        // Permission may arrive after the backend has cancelled this capture.
+        req.signal.throwIfAborted()
         if (req.mode === 'look') return camera.grabFrame()
         if (req.when === 'past') {
           const grid = camera.recentGrid(req.seconds, 9)

@@ -260,8 +260,13 @@ class ChromeLink {
   }
 
   /** Send one framed message and wait for exactly one framed reply. */
-  async request(message) {
+  async request(message, { signal, onSend } = {}) {
     await this.ensureConnected()
+    // A connection attempt can outlive the turn that requested the action.
+    if (signal?.aborted) throw new Error('the user interrupted')
+    const body = Buffer.from(JSON.stringify(message), 'utf8')
+    const header = Buffer.alloc(4)
+    header.writeUInt32LE(body.length, 0)
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         // A timed-out call leaves the stream ambiguous — a late reply would be
@@ -281,25 +286,24 @@ class ChromeLink {
         },
       }
 
-      const body = Buffer.from(JSON.stringify(message), 'utf8')
-      const header = Buffer.alloc(4)
-      header.writeUInt32LE(body.length, 0)
-      this.socket.write(Buffer.concat([header, body]), (err) => {
-        if (err) {
-          this.reset(err)
-        }
-      })
+      try {
+        // Once a write begins, even an error cannot prove the peer did not act.
+        onSend?.()
+        this.socket.write(Buffer.concat([header, body]), (err) => {
+          if (err) this.reset(err)
+        })
+      } catch (err) {
+        this.reset(err)
+      }
     })
   }
 
   /**
    * Run one extension tool. Queued behind whatever is already running.
    *
-   * A dropped connection is retried exactly once, because the overwhelmingly
-   * common cause is a socket that went stale while JARVIS was idle — Chrome was
-   * restarted between two questions — and re-dialling silently is much better
-   * than telling the user their browser is unavailable when it is sitting right
-   * there. A second failure is real and is reported.
+   * Reconnect once if dialing failed before any request was sent. After a write
+   * begins, a timeout or disconnect has an unknown outcome: replaying a click
+   * or typed text could perform the user's action twice.
    */
   call(name, args, signal) {
     const run = async () => {
@@ -320,12 +324,22 @@ class ChromeLink {
       if (signal?.aborted) throw new Error('the user interrupted')
 
       const message = { method: 'execute_tool', params: { tool: name, args: args ?? {} } }
-      try {
-        return await this.request(message)
-      } catch (err) {
-        if (signal?.aborted) throw err
-        this.reset()
-        return await this.request(message)
+      for (let attempt = 0; ; attempt++) {
+        let sent = false
+        try {
+          return await this.request(message, { signal, onSend: () => { sent = true } })
+        } catch (err) {
+          this.reset()
+          if (signal?.aborted) throw err
+          if (sent) {
+            throw new Error(
+              `${err?.message ?? err}. The browser action may have completed; ` +
+                'inspect its current state before retrying.',
+              { cause: err },
+            )
+          }
+          if (attempt >= 1) throw err
+        }
       }
     }
     // Chained on the tail whether or not the previous call succeeded, so one
@@ -936,7 +950,7 @@ export function chromeKit({ allowWrites }) {
         'chrome_new_tab',
         'Open a fresh blank tab and work in it from now on.',
         {},
-        async (args) => {
+        async (args, extra) => {
           const out = await forward('tabs_create_mcp', { needsTab: false })(args, extra)
           // Whatever was just opened is what the next action should land in.
           forgetTab()
@@ -952,7 +966,7 @@ export function chromeKit({ allowWrites }) {
             .union([z.number(), z.string()])
             .describe('The numeric tabId to close, from chrome_tabs.'),
         },
-        async (args) => {
+        async (args, extra) => {
           const out = await forward('tabs_close_mcp', { needsTab: false })(args, extra)
           if (isActiveTab(args.tabId)) forgetTab()
           return out

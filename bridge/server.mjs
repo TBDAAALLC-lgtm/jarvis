@@ -722,7 +722,7 @@ async function proxyRemote(req, res, cors, { kinds, maxBytes, timeoutMs, ranged 
   const status = upstream.statusCode ?? 0
 
   if (status !== 200 && status !== 206) {
-    upstream.resume()
+    upstream.destroy()
     throw proxyError(status === 404 ? 404 : 502, `upstream said ${status}`)
   }
 
@@ -731,17 +731,17 @@ async function proxyRemote(req, res, cors, { kinds, maxBytes, timeoutMs, ranged 
     .trim()
     .toLowerCase()
   if (!kinds.some((kind) => type.startsWith(kind))) {
-    upstream.resume()
+    upstream.destroy()
     throw proxyError(415, `not ${kinds.join(' or ')} (got ${type || 'nothing'})`)
   }
   if (NEVER_PROXIED.has(type)) {
-    upstream.resume()
+    upstream.destroy()
     throw proxyError(415, `${type} is not served from this origin`)
   }
 
   const declared = Number(upstream.headers['content-length'])
   if (Number.isFinite(declared) && declared > maxBytes) {
-    upstream.resume()
+    upstream.destroy()
     throw proxyError(413, 'too large')
   }
 
@@ -817,6 +817,23 @@ function corsFor(req) {
 
 // One HTTP server for both the speech proxy and the WebSocket upgrade.
 const http = await import('node:http')
+
+// The response closes when the client leaves. IncomingMessage's close event
+// also fires after a normal upload, so it cannot cancel the provider request.
+function speechUpstream(res) {
+  const controller = new AbortController()
+  const cancel = () => controller.abort()
+  const timer = setTimeout(cancel, 30_000)
+  res.once('close', cancel)
+  if (res.destroyed) cancel()
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timer)
+      res.removeListener('close', cancel)
+    },
+  }
+}
 
 const handleRequest = async (req, res) => {
   const origin = req.headers.origin
@@ -995,14 +1012,16 @@ const handleRequest = async (req, res) => {
     }
     // A spoken line is a few hundred bytes. Anything approaching this is not a
     // sentence, and buffering it unbounded would let one request eat the heap.
-    let body = ''
+    const chunks = []
+    let size = 0
     let overflowed = false
     for await (const chunk of req) {
-      body += chunk
-      if (body.length > 64 * 1024) {
+      size += chunk.length
+      if (size > 64 * 1024) {
         overflowed = true
         break
       }
+      chunks.push(chunk)
     }
     if (overflowed) {
       req.destroy()
@@ -1013,15 +1032,17 @@ const handleRequest = async (req, res) => {
     // so a malformed body used to take the entire bridge down with it.
     let text
     try {
-      ;({ text } = JSON.parse(body || '{}'))
+      // Decode once: UTF-8 characters can span HTTP chunks.
+      ;({ text } = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'))
     } catch {
       res.writeHead(400, cors)
       return res.end('bad json')
     }
-    if (!text) {
+    if (typeof text !== 'string' || !text.trim()) {
       res.writeHead(400, cors)
       return res.end('no text')
     }
+    const upstreamRequest = speechUpstream(res)
     try {
       const upstream = await fetch(
         `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream` +
@@ -1031,6 +1052,7 @@ const handleRequest = async (req, res) => {
           `?output_format=mp3_22050_32&optimize_streaming_latency=3`,
         {
           method: 'POST',
+          signal: upstreamRequest.signal,
           headers: { 'xi-api-key': key, 'content-type': 'application/json' },
           body: JSON.stringify({
             text,
@@ -1060,8 +1082,12 @@ const handleRequest = async (req, res) => {
       for await (const chunk of upstream.body) res.write(Buffer.from(chunk))
       return res.end()
     } catch (err) {
-      res.writeHead(502, cors)
-      return res.end(String(err?.message ?? err))
+      if (res.destroyed) return
+      if (res.headersSent) return res.destroy()
+      res.writeHead(upstreamRequest.signal.aborted ? 504 : 502, cors)
+      return res.end(upstreamRequest.signal.aborted ? 'speech upstream timed out' : String(err?.message ?? err))
+    } finally {
+      upstreamRequest.cleanup()
     }
   }
 
@@ -1105,6 +1131,7 @@ const handleRequest = async (req, res) => {
       return res.end(JSON.stringify({ text: '' }))
     }
 
+    const upstreamRequest = speechUpstream(res)
     try {
       // The filename extension is the only hint Scribe gets about the codec, so
       // derive it from the content-type the MediaRecorder reported rather than
@@ -1126,6 +1153,7 @@ const handleRequest = async (req, res) => {
 
       const upstream = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
         method: 'POST',
+        signal: upstreamRequest.signal,
         headers: { 'xi-api-key': key },
         body: form,
       })
@@ -1137,8 +1165,12 @@ const handleRequest = async (req, res) => {
       res.writeHead(200, { ...cors, 'content-type': 'application/json' })
       return res.end(JSON.stringify({ text: (data.text ?? '').trim() }))
     } catch (err) {
-      res.writeHead(502, cors)
-      return res.end(String(err?.message ?? err))
+      if (res.destroyed) return
+      if (res.headersSent) return res.destroy()
+      res.writeHead(upstreamRequest.signal.aborted ? 504 : 502, cors)
+      return res.end(upstreamRequest.signal.aborted ? 'speech upstream timed out' : String(err?.message ?? err))
+    } finally {
+      upstreamRequest.cleanup()
     }
   }
 
@@ -1179,7 +1211,9 @@ const wss = new WebSocketServer({
     done(true)
   },
 })
-server.listen(PORT)
+// Origin checks protect browser clients; they are not authentication for a
+// network client that can supply its own Origin header. Keep this bridge local.
+server.listen(PORT, '127.0.0.1')
 
 console.log(`[jarvis] bridge listening on ws://localhost:${PORT}`)
 console.log(
@@ -1283,7 +1317,9 @@ wss.on('connection', (socket) => {
    * turn now arrives wearing the id it was born with, and the client drops it.
    */
   let claudeTurn = null
-  const sendClaude = (msg) => send({ ...msg, ask: claudeTurn })
+  const sendClaude = (msg) => {
+    if (claudeTurn) send({ ...msg, ask: claudeTurn.id })
+  }
 
   /**
    * Asking the browser for something and waiting for the answer.
@@ -1309,6 +1345,7 @@ wss.on('connection', (socket) => {
       const timer = setTimeout(() => {
         waiting.delete(id)
         signal?.removeEventListener('abort', cancel)
+        send({ type: 'cancel', id })
         reject(new Error('the interface did not answer in time'))
       }, timeoutMs)
 
@@ -1370,35 +1407,26 @@ wss.on('connection', (socket) => {
   const seenTools = new Set()
   const heldTools = new Map()
 
-  /**
-   * Resolves when the turn in flight has actually finished.
-   *
-   * Waiting on session.interrupt() alone is not enough. It resolves when the
-   * agent has been *told* to stop, not when it has, so the last tokens of the
-   * abandoned answer are still on their way — and since nothing on the wire
-   * identifies which question a delta belongs to, they land on the next turn's
-   * listener. Measured: ask for ALPHA, interrupt, ask for BRAVO, and BRAVO's
-   * answer arrives as "ALPHA\nBRAVO".
-   *
-   * The SDK emits exactly one `result` per turn, so that is the boundary worth
-   * waiting for. Raced against a timeout because a turn that never reports one
-   * must not wedge the conversation for ever — a stray word is a blemish, a
-   * deadlocked assistant is not.
-   */
-  let settling = Promise.resolve()
-  let finishTurn = null
+  // Completion belongs to a turn. A late result must never clear another
+  // provider's live state or release its cancellation wait.
+  let activeTurn = null
+  let requestGeneration = 0
+  function newTurn(id, provider) {
+    let complete
+    const finished = new Promise((resolve) => { complete = resolve })
+    return { id, provider, finished, complete, settling: null }
+  }
 
-  const turnFinished = () =>
-    new Promise((resolve) => {
-      finishTurn = resolve
-    })
+  function finishTurn(turn) {
+    if (!turn) return
+    if (activeTurn === turn) activeTurn = null
+    if (claudeTurn === turn) claudeTurn = null
+    turn.complete()
+  }
 
-  /**
-   * A brief pause so the abandoned turn's frames are tagged with the OLD id
-   * before the new one is adopted. Short, because correctness now comes from
-   * the tag rather than from the wait — this only has to cover the gap, not
-   * outlast the whole turn.
-   */
+  // If cancellation cannot finish within this window, close the session.
+  // Starting another turn would relabel late Claude output or mutate the
+  // same GPT transcript concurrently.
   const SETTLE_CAP_MS = 400
 
   const announceTool = (id, name, emit = sendClaude) => {
@@ -1574,27 +1602,24 @@ wss.on('connection', (socket) => {
           }
 
           case 'result':
+            if (!claudeTurn) break
             // A result is not automatically a success. The error subtypes
             // carry no `result` field at all, so reporting them as 'done' with
             // empty text is indistinguishable from a turn that simply had
             // nothing to say — the HUD stops spinning and JARVIS stands there
             // silent. Say what happened instead.
             if (msg.subtype === 'success') {
-              // A dead login comes back as a *successful* turn whose whole
-              // text is the refusal. Spoken text only ever comes from
-              // stream deltas and a refusal produces none, so this landed
-              // as silence with no error anywhere on screen. Catch the
-              // shape and raise it as the failure it actually is.
+              // The SDK can put an error in a success-subtype result. Its
+              // explicit flag outranks prose that merely discusses an error;
+              // retain the text fallback for older runtimes without the flag.
               const body = msg.result ?? ''
-              if (AUTH_FAILURE.test(body)) {
+              if (msg.is_error === true || (msg.is_error == null && AUTH_FAILURE.test(body))) {
                 console.error(
-                  '[jarvis] auth failure arrived as a result:',
+                  '[jarvis] failure arrived as a result:',
                   body,
                 )
                 sendClaude({ type: 'error', message: body })
-                turnLive = false
-                finishTurn?.()
-                finishTurn = null
+                finishTurn(claudeTurn)
                 seenTools.clear()
                 heldTools.clear()
                 break
@@ -1616,9 +1641,7 @@ wss.on('connection', (socket) => {
             }
             // Whatever was waiting on this turn to finish can go now. This is
             // the only place a turn is genuinely over.
-            turnLive = false
-            finishTurn?.()
-            finishTurn = null
+            finishTurn(claudeTurn)
             // One turn's tool ids are never referred to again, and these
             // otherwise grow for as long as the socket is open.
             seenTools.clear()
@@ -1679,14 +1702,22 @@ wss.on('connection', (socket) => {
    * has already stopped. Close it so it reconnects.
    */
   function stopSession() {
+    if (closed) return
     closed = true
+    requestGeneration++
     deliver?.(null)
+    deliver = null
+    inbox.length = 0
     // Anything waiting on this turn is never going to be told it finished by
     // the stream, because the stream is gone. Release it here or the next
     // question sits behind the settle cap for a turn that cannot end.
-    turnLive = false
-    finishTurn?.()
-    finishTurn = null
+    finishTurn(activeTurn)
+    gptAbort?.abort()
+    for (const slot of waiting.values()) {
+      clearTimeout(slot.timer)
+      slot.resolve({ error: 'the interface disconnected' })
+    }
+    waiting.clear()
     session.close?.()
     socket.close()
   }
@@ -1717,7 +1748,7 @@ wss.on('connection', (socket) => {
   const GPT_HISTORY_MESSAGES = 60
   let gptAbort = null
 
-  async function answerWithGpt(text, id) {
+  async function answerWithGpt(text, id, turn) {
     // Closed over, not stored. This is the whole point of splitting the tag:
     // every frame this turn emits carries the id this turn was asked with, and
     // nothing a later turn does can reach back and change it.
@@ -1731,17 +1762,8 @@ wss.on('connection', (socket) => {
     gptHistory.push({ role: 'user', content: text })
     gptHistory = trim(gptHistory, GPT_HISTORY_MESSAGES)
 
-    /**
-     * Held locally as well as shared, so this turn only ever disarms itself.
-     *
-     * `gptAbort` is one slot and `answerWithGpt` is re-entrant: an interrupt
-     * waits at most SETTLE_CAP_MS, so when turn N is slow the queued turn N+1
-     * starts while N is still unwinding. N's `finally` then runs second and
-     * blanks the slot — which by that point holds N+1's controller. The live
-     * turn is left with nothing to abort it, so every barge-in for the rest of
-     * that turn does nothing at all and the user keeps talking over an
-     * assistant that will not stop.
-     */
+    // Cleanup owns this controller even when session shutdown has already
+    // released the turn and aborted its pending tool work.
     const abort = new AbortController()
     gptAbort = abort
     try {
@@ -1778,9 +1800,7 @@ wss.on('connection', (socket) => {
       // The interrupt handshake waits on this. An OpenAI turn produces no
       // SDK 'result' message, so nothing else would ever release it and
       // the next question would sit behind the settle cap for nothing.
-      turnLive = false
-      finishTurn?.()
-      finishTurn = null
+      finishTurn(turn)
     }
   }
 
@@ -1793,36 +1813,28 @@ wss.on('connection', (socket) => {
    * is what makes the two cases identical rather than merely similar.
    */
   function stopTalking() {
-    // Held so the next question can wait for it rather than racing it.
-    const stopped = turnFinished()
-    // Whichever one is talking. Aborting an idle provider is a no-op,
-    // so there is nothing to track about who spoke last.
-    gptAbort?.abort()
-    settling = Promise.resolve(session.interrupt?.())
-      .catch(() => {})
-      .then(() =>
-        Promise.race([stopped, new Promise((r) => setTimeout(r, SETTLE_CAP_MS))]),
-      )
+    const turn = activeTurn
+    if (!turn) return Promise.resolve(true)
+    if (turn.settling) return turn.settling
+
+    let timer
+    turn.settling = Promise.race([
+      turn.finished.then(() => true),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(false), SETTLE_CAP_MS) }),
+    ]).finally(() => clearTimeout(timer))
+
+    if (turn.provider === 'gpt') gptAbort?.abort()
+    else void Promise.resolve().then(() => session.interrupt?.()).catch(() => {})
+    return turn.settling
   }
 
-  /**
-   * Whether a turn is running right now.
-   *
-   * Nothing used to ask. `settling` is an already-resolved promise unless an
-   * interrupt happened, so a second `ask` with no interrupt simply started
-   * alongside the first — and since both providers wrote the same turn tag, a
-   * live Claude turn and a new GPT turn would stamp their deltas with the same
-   * id and interleave into one spoken answer. Two brains' sentences spliced
-   * together, mid-word.
-   *
-   * That is reachable from the shipped client, which only sends `interrupt`
-   * while it still holds a pending turn — so any path that clears `pending`
-   * early sends the next question with no interrupt at all.
-   *
-   * One turn at a time is the actual rule; this is the bridge enforcing it
-   * rather than trusting the client to.
-   */
-  let turnLive = false
+  function settlementFailed(id) {
+    send({
+      type: 'error', ask: id,
+      message: 'The previous answer could not be stopped. Reconnecting; please ask again.',
+    })
+    stopSession()
+  }
 
   socket.on('message', (raw) => {
     let msg
@@ -1831,6 +1843,7 @@ wss.on('connection', (socket) => {
     } catch {
       return
     }
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg) || closed) return
 
     if (msg.type === 'ask' && typeof msg.text === 'string') {
       /**
@@ -1849,19 +1862,18 @@ wss.on('connection', (socket) => {
       const text = msg.text
       const id = typeof msg.id === 'string' ? msg.id : null
       const provider = msg.provider === 'gpt' ? 'gpt' : 'claude'
+      const generation = ++requestGeneration
 
-      // A new question while one is still being answered IS an interrupt,
-      // whether or not the client said so. Asking for the same settle the
-      // explicit path asks for is what stops the two turns overlapping.
-      if (turnLive) stopTalking()
-
-      void settling.then(() => {
-        turnLive = true
+      void stopTalking().then((settled) => {
+        if (closed || socket.readyState !== socket.OPEN || generation !== requestGeneration) return
+        if (!settled) return settlementFailed(id)
+        const turn = newTurn(id, provider)
+        activeTurn = turn
         if (provider === 'gpt') {
-          void answerWithGpt(text, id)
+          void answerWithGpt(text, id, turn)
           return
         }
-        claudeTurn = id
+        claudeTurn = turn
         if (deliver) {
           const resolve = deliver
           deliver = null
@@ -1881,13 +1893,17 @@ wss.on('connection', (socket) => {
       }
     }
 
-    if (msg.type === 'interrupt') stopTalking()
+    if (msg.type === 'interrupt') {
+      const generation = ++requestGeneration
+      const id = activeTurn?.id ?? null
+      void stopTalking().then((settled) => {
+        if (!closed && generation === requestGeneration && !settled) settlementFailed(id)
+      })
+    }
   })
 
   socket.on('close', () => {
     console.log('[jarvis] client disconnected')
-    closed = true
-    deliver?.(null)
     // The Claude session is closed here and the OpenAI request was not, which
     // is a difference with a bill attached: a completion nobody is listening to
     // keeps generating to its natural end, and every token of it is charged for
@@ -1895,7 +1911,10 @@ wss.on('connection', (socket) => {
     // tools it can also still be mid-round, so the next round would fire off a
     // fresh request for a page nobody is going to see. Closing the tab should
     // stop the work, on both brains.
-    gptAbort?.abort()
-    session.close?.()
+    stopSession()
+  })
+  socket.on('error', (err) => {
+    console.error('[jarvis] websocket error:', err.message)
+    stopSession()
   })
 })

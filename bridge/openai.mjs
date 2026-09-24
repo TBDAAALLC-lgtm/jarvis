@@ -283,9 +283,7 @@ export async function streamChat({
   }
 
   let full = ''
-  let buffer = ''
   let finishReason = null
-  const decoder = new TextDecoder()
 
   /**
    * Tool calls arrive in pieces, and the pieces are not self-describing.
@@ -304,56 +302,44 @@ export async function streamChat({
   const announced = new Set()
 
   try {
-    for await (const chunk of res.body) {
-      buffer += decoder.decode(Buffer.from(chunk), { stream: true })
+    for await (const event of sseEvents(res.body)) {
+      const payload = event.data.trim()
+      if (payload === '[DONE]') break
+      let json
+      try {
+        json = JSON.parse(payload)
+      } catch {
+        throw new Error(`OpenAI stream (${model}): malformed JSON event`)
+      }
+      // Errors can arrive after HTTP 200 and after text has already streamed.
+      // They must reach the same caller error path as a failed initial POST.
+      if (event.name === 'error' || json?.error) {
+        const error = json?.error ?? json
+        throw new Error(`OpenAI stream (${model}): ${error?.message ?? 'provider error'}`)
+      }
 
-      // SSE frames are separated by a blank line; a chunk can split one in
-      // half, so only complete frames are consumed and the tail is kept.
-      const frames = buffer.split('\n\n')
-      buffer = frames.pop() ?? ''
+      const choice = json?.choices?.[0]
+      const delta = choice?.delta?.content
+      if (delta) {
+        full += delta
+        onDelta?.(delta)
+      }
 
-      for (const frame of frames) {
-        for (const line of frame.split('\n')) {
-          if (!line.startsWith('data:')) continue
-          const payload = line.slice(5).trim()
-          if (!payload || payload === '[DONE]') continue
-          let json
-          try {
-            json = JSON.parse(payload)
-          } catch {
-            continue // a keepalive or a comment, not a delta
-          }
-          const choice = json.choices?.[0]
-          const delta = choice?.delta?.content
-          if (delta) {
-            full += delta
-            onDelta?.(delta)
-          }
+      for (const part of choice?.delta?.tool_calls ?? []) {
+        const i = part.index ?? 0
+        const call = calls.get(i) ?? { id: '', name: '', args: '' }
+        if (part.id) call.id = part.id
+        if (part.function?.name) call.name += part.function.name
+        if (part.function?.arguments) call.args += part.function.arguments
+        calls.set(i, call)
 
-          for (const part of choice?.delta?.tool_calls ?? []) {
-            const i = part.index ?? 0
-            const call = calls.get(i) ?? { id: '', name: '', args: '' }
-            if (part.id) call.id = part.id
-            if (part.function?.name) call.name += part.function.name
-            if (part.function?.arguments) call.args += part.function.arguments
-            calls.set(i, call)
-
-            // Announced the moment the name is whole enough to be worth
-            // saying, rather than after the arguments finish streaming. On a
-            // long argument list that is a visible wait, and the badge exists
-            // to say "something is happening" at the point it starts.
-            if (call.name && !announced.has(i)) {
-              announced.add(i)
-              onTool?.(call.name)
-            }
-          }
-
-          // Carried out because it is the only thing that distinguishes "the
-          // model is done" from "the model stopped to use a tool", and the
-          // caller decides what to do about that.
-          if (choice?.finish_reason) finishReason = choice.finish_reason
+        // Announce each tool once, as soon as its name arrives.
+        if (call.name && !announced.has(i)) {
+          announced.add(i)
+          onTool?.(call.name)
         }
       }
+      if (choice?.finish_reason) finishReason = choice.finish_reason
     }
   } catch (err) {
     if (err?.name === 'AbortError') {
@@ -365,7 +351,60 @@ export async function streamChat({
     throw err
   }
 
+  // EOF is not proof that the model finished. In particular, a tool delta can
+  // contain valid JSON before the provider stops generating the call.
+  if (!finishReason) throw new Error(`OpenAI stream (${model}) ended before completion`)
+  if (
+    (calls.size && finishReason !== 'tool_calls') ||
+    (finishReason === 'tool_calls' && !calls.size) ||
+    [...calls.values()].some((call) => !call.id || !call.name)
+  ) {
+    throw new Error(`OpenAI stream (${model}): incomplete tool calls`)
+  }
+
   return { text: full, model, aborted: false, toolCalls: collect(calls), finishReason }
+}
+
+/** SSE allows LF, CRLF and CR, including delimiters split across chunks. */
+async function* sseEvents(body) {
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let afterCR = false
+  let name = ''
+  let data = []
+
+  for await (const chunk of body) {
+    let text = decoder.decode(chunk, { stream: true })
+    if (afterCR && text.length) {
+      if (text[0] === '\n') text = text.slice(1)
+      afterCR = false
+    }
+    buffer += text
+    let start = 0
+    for (let i = 0; i < buffer.length; i++) {
+      if (buffer[i] !== '\r' && buffer[i] !== '\n') continue
+      const line = buffer.slice(start, i)
+      if (buffer[i] === '\r') {
+        if (buffer[i + 1] === '\n') i++
+        else if (i === buffer.length - 1) afterCR = true
+      }
+      start = i + 1
+      if (!line) {
+        if (data.length) yield { name, data: data.join('\n') }
+        name = ''
+        data = []
+        continue
+      }
+      if (line.startsWith(':')) continue
+      const colon = line.indexOf(':')
+      const field = colon < 0 ? line : line.slice(0, colon)
+      let value = colon < 0 ? '' : line.slice(colon + 1)
+      if (value.startsWith(' ')) value = value.slice(1)
+      if (field === 'event') name = value
+      if (field === 'data') data.push(value)
+    }
+    buffer = buffer.slice(start)
+  }
 }
 
 /**

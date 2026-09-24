@@ -487,7 +487,7 @@ export async function renderPage(url, mode, bridgeOrigin) {
       'content-type': 'text/html; charset=utf-8',
       'content-security-policy': csp,
       'x-content-type-options': 'nosniff',
-      referrerpolicy: 'no-referrer',
+      'referrer-policy': 'no-referrer',
       /**
        * Not cached, deliberately.
        *
