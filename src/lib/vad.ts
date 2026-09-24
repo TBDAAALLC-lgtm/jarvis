@@ -63,6 +63,27 @@ const RELEASE_RATIO = 0.6
 
 /** Sustained energy for this long confirms speech rather than a knock or click. */
 const START_MS = 110
+
+/**
+ * The same confirmation, while he is talking — and much longer, because the
+ * question being asked is a different one.
+ *
+ * Starting to record costs nothing when it turns out to be a cough: the
+ * segment is discarded and nobody notices. Cutting him off mid-sentence costs
+ * the answer, and the user has to ask again. Those two decisions were sharing
+ * one number, and it was tuned for the cheap one.
+ *
+ * 110ms sits comfortably inside a keyboard click, a chair creak, a door, a
+ * knock on the desk. The guard threshold does not save you from any of them:
+ * it is set to reject *his own playback leaking back in*, which is a question
+ * about loudness — and a pin drop is not quiet, it is brief. Loudness was
+ * never the signal separating a person from a noise. Duration is.
+ *
+ * So while he speaks, the sound has to persist. Speech does that trivially;
+ * even "stop" runs past three hundred milliseconds. Transients do not, which
+ * is exactly what makes them transients.
+ */
+const GUARD_START_MS = 320
 /**
  * Quiet for this long ends the SEGMENT — which is no longer the same thing as
  * ending the turn.
@@ -227,8 +248,9 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
           // a blip, the recorder is discarded and nothing was lost.
           armedAt = now
           startRecorder()
-        } else if (now - armedAt >= START_MS) {
-          // Confirmed. This is the moment barge-in fires.
+        } else if (now - armedAt >= (guard ? GUARD_START_MS : START_MS)) {
+          // Confirmed. This is the moment barge-in fires — which is why the
+          // window is longer when he is the one talking. See GUARD_START_MS.
           speaking = true
           speechStartedAt = armedAt
           lastLoud = now

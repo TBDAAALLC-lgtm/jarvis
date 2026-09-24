@@ -436,7 +436,16 @@ export async function ask(
     const arm = () => {
       clearTimeout(timer)
       timer = window.setTimeout(() => {
-        fail(new Error('The bridge went quiet — that turn was lost.'))
+        // Says what happened, then what to do about it. "The bridge went
+        // quiet" described the symptom from the code's point of view and left
+        // the reader with nothing to act on — and it is the message they see
+        // most, because it is what every silent failure eventually becomes.
+        fail(
+          new Error(
+            `No answer after ${Math.round(IDLE_TIMEOUT_MS / 1000)} seconds. ` +
+              'Ask again — if it keeps happening, try the other tile.',
+          ),
+        )
       }, IDLE_TIMEOUT_MS)
     }
 

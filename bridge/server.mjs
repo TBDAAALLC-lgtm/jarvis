@@ -110,6 +110,38 @@ const ALLOW_WRITES =
   process.env.JARVIS_ALLOW_WRITES === '1' || process.argv.includes('--writes')
 
 /**
+ * The browser's hands, without the machine's.
+ *
+ * `--writes` is all-or-nothing by design, and that is the right default for a
+ * voice interface: one flag, one decision, nothing hidden. But it bundles two
+ * very different risks. Clicking a button on a page the user is watching is
+ * recoverable and visible — they can see the tab, and they asked for it. A
+ * shell command, a file write or an outbound call from some MCP server is
+ * none of those things.
+ *
+ * So the common case — "let JARVIS actually use my browser" — should not
+ * require granting the rest. This flag enables the six acting Chrome tools
+ * (click, type, key, form input, new tab, close tab) and changes nothing else:
+ * WRITE_BUILTINS, the MCP verb veto and every other consumer of ALLOW_WRITES
+ * are untouched, so Bash, Write, Edit and the effectful MCP surface stay shut.
+ *
+ * It is deliberately a widening of the browser gate only, never a narrowing:
+ * `--writes` alone still enables the browser exactly as it always did, so no
+ * existing invocation changes meaning.
+ *
+ * The gate itself is not duplicated. chromeKit decides at construction which
+ * tools to build, decideTool already waves `jarvis_chrome` through for exactly
+ * that reason, and both brains are handed the same kit — so this constant is
+ * consumed in precisely one place.
+ */
+const ALLOW_BROWSER_WRITES =
+  process.env.JARVIS_ALLOW_BROWSER_WRITES === '1' ||
+  process.argv.includes('--browser-writes')
+
+/** What the browser tools are actually built with. */
+const BROWSER_WRITES = ALLOW_WRITES || ALLOW_BROWSER_WRITES
+
+/**
  * The orchestrator model. Override with JARVIS_MODEL to trade quality for pace
  * — claude-sonnet-5 is noticeably snappier on camera if Opus feels slow.
  */
@@ -1224,6 +1256,15 @@ console.log(
   `[jarvis] writes ${ALLOW_WRITES ? 'ENABLED' : 'disabled'}` +
     (ALLOW_WRITES ? '' : ' — set JARVIS_ALLOW_WRITES=1 to permit shell/file/device actions'),
 )
+// Said separately from the line above, because it is now possible for the
+// browser to be able to act while the machine cannot, and one line reporting
+// "writes disabled" would be read as covering both.
+if (!ALLOW_WRITES && ALLOW_BROWSER_WRITES) {
+  console.log(
+    '[jarvis] browser actions ENABLED — clicking and typing in Chrome only;' +
+      ' shell, files and other tools remain read-only',
+  )
+}
 // Asynchronous, so it lands a beat after the rest of the banner. Worth printing
 // at all because an extension that is simply not running is indistinguishable
 // at the tool boundary from one that is broken, and this is the one place the
@@ -1231,7 +1272,11 @@ console.log(
 void chromeAvailable().then((ok) => {
   console.log(
     ok
-      ? `[jarvis] browser control ready${ALLOW_WRITES ? '' : ' (reading only — clicking and typing need JARVIS_ALLOW_WRITES=1)'}`
+      ? `[jarvis] browser control ready${
+          BROWSER_WRITES
+            ? ' — reading and acting'
+            : ' (reading only — clicking and typing need --browser-writes, or --writes for everything)'
+        }`
       : '[jarvis] browser control unavailable — open Chrome with the Claude extension enabled',
   )
 })
@@ -1470,7 +1515,7 @@ wss.on('connection', (socket) => {
     // The browser server gates itself at construction: chromeKit only builds
     // the acting tools when ALLOW_WRITES is set, so in read-only mode those
     // tools are absent from both brains rather than present and refused.
-    chromeKit({ allowWrites: ALLOW_WRITES }),
+    chromeKit({ allowWrites: BROWSER_WRITES }),
     visionKit(ask),
   ]
 
@@ -1681,29 +1726,106 @@ wss.on('connection', (socket) => {
        * So a clean end is handled exactly like a dirty one, because to the
        * person waiting they are the same event.
        */
-      console.error('[jarvis] session stream ended')
-      sendClaude({
-        type: 'error',
-        message: 'The connection to Claude ended. Reconnecting.',
-      })
-      stopSession()
+      stopClaude('the stream finished')
     } catch (err) {
-      console.error('[jarvis] session error:', err)
-      send({ type: 'error', message: String(err?.message ?? err) })
-      stopSession()
+      stopClaude(String(err?.message ?? err))
     }
   })()
 
   /**
-   * Nothing will ever be read from the stream again.
+   * One brain died. That is not the same event as the socket dying.
    *
-   * Leaving the socket open would leave the client believing it has a working
-   * bridge, and every later question would hang for ever waiting on a pump that
-   * has already stopped. Close it so it reconnects.
+   * This used to call stopSession(), which closes the socket — and closing the
+   * socket is how the client learns to reconnect, which it does by starting a
+   * fresh session with no memory. Correct for Claude, whose transcript lived in
+   * the session that just ended. Ruinous for GPT, whose transcript lives out
+   * here in `gptHistory`, on this socket, and was fine.
+   *
+   * Observed exactly that way: the Agent SDK kept failing mid-tool
+   * (`error_during_execution`, `stop_reason=tool_use`), the stream ended, the
+   * socket closed, and the screen said "the previous conversation was not
+   * kept" — wiping a GPT conversation that had nothing to do with it. One
+   * brain's failure took down the other brain's memory.
+   *
+   * So the two are separated. Claude's end releases Claude's machinery and
+   * says so; the socket stays up, GPT keeps its history, and the tile is the
+   * thing that reports the loss.
+   */
+  let claudeDead = false
+
+  function stopClaude(message) {
+    if (claudeDead || closed) return
+    claudeDead = true
+
+    // The generator feeding the SDK, and anything queued for it. Released
+    // rather than left waiting on a pump that has stopped.
+    deliver?.(null)
+    deliver = null
+    inbox.length = 0
+
+    // Deliberately NOT touched: gptAbort, the camera `waiting` map, and the
+    // socket. Aborting a live GPT turn or cancelling its capture because the
+    // other brain fell over is the bug this function exists to stop.
+    session.close?.()
+    console.error(`[jarvis] claude session ended — ${message}`)
+
+    /**
+     * Tell the waiting turn before ending it, not after.
+     *
+     * `sendClaude` is `if (claudeTurn) send(...)`, and `finishTurn` nulls
+     * `claudeTurn`. Finishing first therefore does not mistag the error — it
+     * drops it silently, and the question that was in flight hangs until the
+     * client's idle timer gives up with nothing on screen to explain it. The
+     * exact failure this whole function was written to stop, reintroduced two
+     * lines below the comment describing it.
+     *
+     * So the id is captured while it still exists, the frame goes out tagged
+     * with it, and only then is the turn released.
+     */
+    const dying = activeTurn?.provider === 'claude' ? activeTurn : null
+    if (dying) {
+      send({
+        type: 'error',
+        ask: dying.id,
+        message:
+          'Claude stopped mid-answer and its conversation is gone. ' +
+          'GPT is still connected — switch tiles, or reload to restart Claude.',
+      })
+      // A GPT turn, if one is running, is untouched: finishing it here would
+      // let the next question start alongside it.
+      finishTurn(dying)
+    }
+
+    /**
+     * And when nothing was waiting, nothing is sent.
+     *
+     * The obvious thing — announce it anyway, so the user hears about a dead
+     * tile — is wrong, and wrong in the direction this whole function was
+     * written to avoid. An error frame with no `ask` passes the client's
+     * `if (msg.ask && msg.ask !== id) return` guard, because the guard only
+     * rejects frames belonging to a *different* turn. An untagged one belongs
+     * to all of them, so it lands on whichever turn is listening: Claude dying
+     * quietly in the background would fail the GPT answer the user is
+     * currently reading, which is precisely the cross-brain damage being fixed
+     * two lines above.
+     *
+     * Claude's death still reaches them, twice over and correctly addressed:
+     * tagged to the dying turn if one was in flight, and on their next Claude
+     * question via the `claudeDead` branch in the ask handler. The tile's own
+     * readiness is the place for standing state; a turn error is not.
+     */
+  }
+
+  /**
+   * Nothing will ever be read from this socket again.
+   *
+   * Leaving it open would leave the client believing it has a working bridge,
+   * and every later question would hang for ever. Close it so it reconnects.
    */
   function stopSession() {
     if (closed) return
     closed = true
+    claudeDead = true
     requestGeneration++
     deliver?.(null)
     deliver = null
@@ -1873,6 +1995,21 @@ wss.on('connection', (socket) => {
           void answerWithGpt(text, id, turn)
           return
         }
+        // The session this question needed is gone, and nothing is reading the
+        // generator any more. Answered here, because the alternative is a
+        // question that sits in `inbox` until the client's idle timer gives up
+        // two minutes later with nothing on screen explaining it.
+        if (claudeDead) {
+          finishTurn(turn)
+          return send({
+            type: 'error',
+            ask: id,
+            message:
+              'Claude has stopped answering. Switch to the GPT tile, or ' +
+              'reload the page to start a new Claude session.',
+          })
+        }
+
         claudeTurn = turn
         if (deliver) {
           const resolve = deliver

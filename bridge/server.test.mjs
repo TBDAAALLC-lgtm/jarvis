@@ -42,6 +42,7 @@ function connection({ interrupt = () => Promise.resolve() } = {}) {
       while (!ended) {
         const value = events.length ? events.shift() : await new Promise((r) => { receive = r })
         if (value === null) return
+        if (value instanceof Error) throw value
         yield value
       }
     },
@@ -67,7 +68,7 @@ function connection({ interrupt = () => Promise.resolve() } = {}) {
     console: { log() {}, error() {}, warn() {} },
     process: { env: {} },
     homedir: () => 'C:/synthetic',
-    MCP_SERVERS: {}, ALLOW_WRITES: false, MODEL: 'test', EFFORT: 'low',
+    MCP_SERVERS: {}, ALLOW_WRITES: false, BROWSER_WRITES: false, MODEL: 'test', EFFORT: 'low',
     SYSTEM_PROMPT: '', WRITE_REFUSAL: '',
     displayKit: () => kit('display'), uiKit: () => kit('ui'),
     chromeKit: () => kit('chrome'), visionKit: (askBrowser) => { capture = askBrowser; return kit('vision') },
@@ -251,6 +252,75 @@ test('SDK error metadata is respected even with a success result subtype', async
   assert.ok(!h.frames.some((frame) => frame.type === 'done'))
   h.socket.close()
 })
+
+for (const ending of ['EOF', 'stream error']) {
+  const failClaude = (h) => h.event(ending === 'EOF' ? null : new Error('Synthetic Claude stream failure'))
+
+  test(`Claude ${ending} settles its active request with one correctly tagged error`, async (t) => {
+    const h = connection()
+    t.after(() => h.socket.close())
+    h.send(ask('claude-live'))
+    await tick()
+    failClaude(h)
+    await tick()
+
+    const errors = h.frames.filter((frame) => frame.type === 'error')
+    assert.equal(errors.length, 1)
+    assert.equal(errors[0].ask, 'claude-live')
+    assert.ok(!h.frames.some((frame) => frame.type === 'done' && frame.ask === 'claude-live'))
+    assert.equal(h.socket.readyState, h.socket.OPEN)
+
+    // The dead provider fails subsequent requests immediately, while the other
+    // provider can still start instead of waiting behind the abandoned turn.
+    h.send(ask('claude-after-failure'))
+    await tick()
+    assert.equal(h.frames.filter((frame) => frame.type === 'error' && frame.ask === 'claude-after-failure').length, 1)
+    assert.deepEqual(h.inputs, ['claude-live'])
+    h.send(ask('gpt-after-failure', 'gpt'))
+    await tick()
+    assert.equal(h.runs.length, 1)
+    h.runs[0].resolve({ text: 'GPT is available', aborted: false })
+    await tick()
+    assert.equal(h.frames.filter((frame) => frame.type === 'error' && frame.ask === 'claude-live').length, 1)
+    assert.ok(h.frames.some((frame) => frame.type === 'done' && frame.ask === 'gpt-after-failure'))
+  })
+
+  test(`Claude ${ending} does not fail the current GPT listener or discard its history`, async (t) => {
+    const h = connection()
+    t.after(() => h.socket.close())
+    h.send(ask('gpt-first', 'gpt'))
+    await tick()
+    h.runs[0].options.history.push({ role: 'assistant', content: 'First GPT answer' })
+    h.runs[0].resolve({ text: 'First GPT answer', aborted: false })
+    await tick()
+
+    h.send(ask('gpt-live', 'gpt'))
+    await tick()
+    failClaude(h)
+    await tick()
+    assert.equal(h.socket.readyState, h.socket.OPEN)
+    assert.equal(h.runs[1].options.signal.aborted, false)
+    // The actual client accepts untagged errors as errors for its current ask.
+    // A provider-status notification must not use this turn-error channel.
+    assert.ok(!h.frames.some((frame) => frame.type === 'error' && (!frame.ask || frame.ask === 'gpt-live')))
+
+    h.runs[1].options.onDelta('Second GPT answer')
+    h.runs[1].options.history.push({ role: 'assistant', content: 'Second GPT answer' })
+    h.runs[1].resolve({ text: 'Second GPT answer', aborted: false })
+    await tick()
+    assert.ok(h.frames.some((frame) => frame.type === 'text' && frame.ask === 'gpt-live'))
+    assert.ok(h.frames.some((frame) => frame.type === 'done' && frame.ask === 'gpt-live'))
+
+    h.send(ask('gpt-next', 'gpt'))
+    await tick()
+    assert.equal(h.runs.length, 3)
+    assert.deepEqual(Array.from(h.runs[2].options.history, (message) => message.content), [
+      'gpt-first', 'First GPT answer', 'gpt-live', 'Second GPT answer', 'gpt-next',
+    ])
+    h.runs[2].resolve({ text: 'Continued', aborted: false })
+    await tick()
+  })
+}
 
 function requestHandler(fetch, extra = {}) {
   return vm.runInNewContext(requestSource, {

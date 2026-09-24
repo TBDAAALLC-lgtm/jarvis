@@ -10,6 +10,7 @@
   },
   "scripts": {
     "start": "node scripts/start.mjs",
+    "start:browser": "node scripts/start.mjs --browser-writes",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
@@ -18,6 +19,7 @@
     "preview": "vite preview",
     "bridge": "node bridge/server.mjs",
     "bridge:writes": "node bridge/server.mjs --writes",
+    "bridge:browser": "node bridge/server.mjs --browser-writes",
     "setup": "node scripts/setup.mjs"
   },
   "dependencies": {

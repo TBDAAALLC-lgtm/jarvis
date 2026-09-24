@@ -154,12 +154,35 @@ export function Hud() {
   const activeTool = useStore((s) => s.activeTool)
   const connected = useStore((s) => s.connected)
   const error = useStore((s) => s.error)
+  const setError = useStore((s) => s.setError)
   const level = useStore((s) => s.level)
   const voice = useStore((s) => s.voice)
   const bootNote = useStore((s) => s.bootNote)
   const gestures = useStore((s) => s.gestures)
   const looking = useStore((s) => s.looking)
   const ui = useStore((s) => s.ui)
+
+  /**
+   * An error is news, not a state. It should stop being on screen.
+   *
+   * Nothing cleared this except saying the wake word again, so one failed turn
+   * left a red line across the interface for the rest of the session — and
+   * because it never moved, it went on describing a problem that had usually
+   * resolved itself two questions ago. A stale warning is worse than none: it
+   * teaches you to stop reading the one place the interface has to report
+   * things.
+   *
+   * Long enough to read twice, then gone. The tiles carry anything that is
+   * genuinely persistent — an expired login stays on the tile, where it
+   * belongs, rather than in a line about one turn.
+   */
+  useEffect(() => {
+    if (!error) return
+    // Roughly reading speed, with a floor for short messages.
+    const ms = Math.min(20000, Math.max(7000, error.length * 90))
+    const t = setTimeout(() => setError(null), ms)
+    return () => clearTimeout(t)
+  }, [error, setError])
 
   // accentFor folds JARVIS's overrides in over the phase colour, so one
   // variable on the root carries a theme change into every .hud-* rule without
@@ -313,7 +336,11 @@ export function Hud() {
 
       {ui.chrome.suggestions && <Suggestions />}
 
-      {error && <div className="error">{error}</div>}
+      {error && (
+        <div className="error" role="status" onClick={() => setError(null)}>
+          {error}
+        </div>
+      )}
 
       <footer className="hud-bottom">
         <span className="hint">

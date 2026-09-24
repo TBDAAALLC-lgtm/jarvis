@@ -8,6 +8,10 @@
  *
  * Pass --writes to allow JARVIS to take real actions (drive the phone, the
  * browser, send things): `npm start -- --writes`.
+ *
+ * Pass --browser-writes for the browser alone — clicking and typing in Chrome,
+ * with the shell, the filesystem and everything else still read-only:
+ * `npm start -- --browser-writes`, or `npm run start:browser`.
  */
 
 import { spawn } from 'node:child_process'
@@ -45,6 +49,16 @@ function vendorWasm() {
 }
 
 const writes = process.argv.includes('--writes')
+/**
+ * Chrome's hands without the machine's.
+ *
+ * Forwarded rather than re-derived: the bridge runs as a child process and
+ * never sees this one's argv, so a flag the launcher swallowed would silently
+ * do nothing. Passed as the environment variable for the same reason
+ * `--writes` is — npm hands scripts to cmd.exe on Windows, where an inline
+ * `VAR=1` prefix fails before Node is ever reached.
+ */
+const browserWrites = process.argv.includes('--browser-writes')
 
 // A dim label per process, so the interleaved logs stay readable.
 const paint = (tag, colour) => (line) =>
@@ -106,6 +120,9 @@ process.on('SIGTERM', () => shutdown(0))
  */
 const port = process.env.PORT
 const bridgeEnv = writes ? { JARVIS_ALLOW_WRITES: '1' } : {}
+// Additive, and only when it would mean something. `--writes` already enables
+// the browser, so setting both would just be two names for one state.
+if (browserWrites && !writes) bridgeEnv.JARVIS_ALLOW_BROWSER_WRITES = '1'
 if (port) {
   bridgeEnv.JARVIS_ALLOWED_ORIGINS = `http://localhost:${port},http://127.0.0.1:${port}`
   console.log(`  serving the face on port ${port}; the bridge will accept it.\n`)

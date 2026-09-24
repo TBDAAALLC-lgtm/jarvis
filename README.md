@@ -277,6 +277,38 @@ npm run bridge:writes
 > Read `decideTool()` before you do. *"Hey Jarvis, clean up my downloads folder"*
 > means something rather different with writes enabled.
 
+### Just the browser
+
+Wanting JARVIS to actually *use* your browser is the common case, and it does
+not have to mean handing over the shell as well:
+
+```bash
+npm run start:browser     # the whole app
+npm run bridge:browser    # the bridge alone
+```
+
+That enables the six acting Chrome tools — click, type, key, form input, open
+tab, close tab — and nothing else. `Bash`, `Write`, `Edit` and every effectful
+tool on your other MCP servers stay shut, exactly as they are with no flag at
+all. The startup banner says which mode you are in rather than leaving you to
+infer it:
+
+```
+[jarvis] writes disabled — set JARVIS_ALLOW_WRITES=1 to permit shell/file/device actions
+[jarvis] browser actions ENABLED — clicking and typing in Chrome only; shell, files and other tools remain read-only
+[jarvis] browser control ready — reading and acting
+```
+
+`--writes` already includes the browser, so it needs no second flag and nothing
+about it changes. Either flag can also be set as an environment variable —
+`JARVIS_ALLOW_BROWSER_WRITES=1` — and `bridge/browser-policy.test.mjs` asserts
+that turning the browser on adds browser tools and moves nothing else.
+
+Two things still gate the browser above this flag, and both are outside the
+bridge: Chrome must be running with the Claude extension enabled, and the
+extension asks you per site before it will act on one. A refusal there is the
+extension's, not JARVIS's.
+
 ---
 
 ## Troubleshooting

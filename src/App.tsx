@@ -134,6 +134,10 @@ export default function App() {
     // putting its own up. Anything the model marked sticky survives.
     s.clearPanels()
     s.clearBlades()
+    // Last turn's failure is not this turn's. Cleared on the way in as well as
+    // on wake, because pressing space or typing never goes through onWake and
+    // so could not clear it at all.
+    s.setError(null)
     s.setCaption('')
     s.pushTurn({ id: newId(), role: 'user', text: said })
     s.setPhase('thinking')
