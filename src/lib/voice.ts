@@ -265,9 +265,21 @@ const norm = (s: string) =>
  * Short words that must always cut through, even when they collide with what
  * he happens to be saying. Suppressing "stop" because he just said "stop"
  * would be the single most infuriating failure this file could have.
+ *
+ * "no" used to be on this list and was the reason he interrupted himself.
+ * Everything here is granted two exemptions at once — isEcho waves it through
+ * as definitely-not-playback, and the guard check then skips both the
+ * self-guard clock and the two-word rule — so a word on this list fires a
+ * barge-in instantly, from a single syllable, with no defence left. That is
+ * correct for "stop", which is a button. It is ruinous for "no", which is the
+ * most common word in his own speech: every "no record of it" and "there is
+ * no" leaked into the microphone, cleared both gates, and cut him off
+ * mid-sentence. Membership here is not "words that mean stop" — it is "words
+ * worth losing a sentence to". "no" is not one; cancel, quiet and enough carry
+ * the same intent without appearing in every other answer.
  */
 const OVERRIDE =
-  /\b(stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it|no)\b/i
+  /\b(stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it)\b/i
 
 /**
  * Words too common to be evidence of anything.
@@ -296,7 +308,22 @@ const STOP = new Set(
  */
 function isEcho(heard: string, spoken: string): boolean {
   if (!spoken) return false
-  if (OVERRIDE.test(heard)) return false
+  /**
+   * An override word is only evidence when HE did not just say it.
+   *
+   * This exemption exists so "stop" is never suppressed for colliding with his
+   * speech, and that is right. But taken unconditionally it inverts: the more
+   * ordinary the word, the more often his own playback contains it, and the
+   * exemption then certifies his voice as the user's — after which the guard
+   * check skips its remaining defences because the same word is on the same
+   * list. Two independent gates, defeated by one token, and the second can
+   * never help because the first has already cleared it.
+   *
+   * Hearing "stop" while he is saying "stop" is the one case worth being wrong
+   * about, so the word is still honoured; what it no longer does is prove the
+   * audio came from the room when it demonstrably matches his own output.
+   */
+  if (OVERRIDE.test(heard) && !OVERRIDE.test(spoken)) return false
 
   const all = norm(heard).split(' ').filter(Boolean)
   if (!all.length) return true
