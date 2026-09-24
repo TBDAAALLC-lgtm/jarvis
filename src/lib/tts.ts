@@ -31,7 +31,7 @@ type Speaker = {
   /** Feed streamed text in. Complete sentences are spoken as they appear. */
   push: (delta: string) => void
   /** Speak a phrase ahead of anything still queued. Used for filler like
-   *  "Looking." while a tool runs. */
+   *  "Working on it, sir" while a tool runs. */
   say: (text: string) => void
   /** No more text coming — flush the remainder and resolve when audio ends. */
   end: () => Promise<void>
@@ -165,51 +165,48 @@ const MAX_UNSPOKEN = 220
 const VOICE_PREF_KEY = 'jarvis.voice'
 
 /**
- * Rank installed voices by how close they are to the character: a deep,
- * level male voice, not a novelty one.
+ * Rank installed voices by how close they are to the character: a British
+ * male, low and level, not a novelty voice.
  *
- * Reweighted for a deeper, level delivery. The
- * previous ranking was built for a British butler and scored en-GB above
- * everything, which on Windows was actively wrong: Microsoft David and
- * Microsoft Guy — the two deep male voices almost every Windows machine
- * actually has — matched no name rule at all, scored 5 against a threshold
- * of 40, and were dropped from the candidate list entirely. The picker then
- * fell through to its last resort and chose Microsoft Zira, who is female.
- * So the voice nobody wanted was the only one a stock Windows box could get.
+ * The big win on macOS is the Enhanced/Premium variant of Daniel. The stock
+ * "Daniel" is a compact voice from a decade ago and sounds it; the Enhanced
+ * download is free (System Settings → Accessibility → Spoken Content → System
+ * Voice → Manage Voices) and once installed it appears here automatically.
  *
- * macOS keeps its Enhanced/Premium downloads worth having: the stock voices
- * are a decade old and sound it, and the better variants appear here
- * automatically once installed (System Settings → Accessibility → Spoken
- * Content → System Voice → Manage Voices).
+ * Windows is the case this originally got wrong, and it is worth keeping
+ * separate from the question of character. A stock Windows box has no British
+ * male voice at all: Microsoft David and Microsoft Guy are what it actually
+ * ships, they matched no rule here, scored 5 against a threshold of 40, and so
+ * were dropped from the candidate list entirely — leaving the picker to fall
+ * through to its last resort and choose Microsoft Zira, who is female. They are
+ * ranked below every en-GB option rather than above it, because they are the
+ * fallback for a machine that has nothing closer, not the thing being aimed at.
  */
 function score(v: SpeechSynthesisVoice): number {
   const n = v.name.toLowerCase()
   let s = 0
 
-  // Windows first, because that is where the deep male voices are and
-  // where they were previously unreachable. David is the darkest of them.
-  if (n.includes('david')) s += 105
-  else if (n.includes('guy')) s += 95
-  else if (/\b(mark|christopher|eric|roger|steffan|brandon)\b/.test(n)) s += 75
-  // macOS, and the Google network voices.
-  else if (n.startsWith('daniel')) s += 90
-  else if (n.includes('google us english')) s += 80
-  else if (n.includes('google uk english male')) s += 78
-  else if (/\b(oliver|arthur|jamie|malcolm|ryan|george|thomas|alex|fred)\b/.test(n)) s += 70
-  // Casual, but serviceable.
+  // The macOS British male, and the closest thing to the character available
+  // without leaving the machine.
+  if (n.startsWith('daniel')) s += 100
+  else if (n.includes('google uk english male')) s += 85
+  else if (/\b(oliver|arthur|jamie|malcolm)\b/.test(n)) s += 80
+  // Newer macOS en-GB male voices — casual, but serviceable.
   else if (/\b(reed|rocko|eddy)\b/.test(n)) s += 40
+  // What Windows actually has. Above the threshold so they are reachable at
+  // all, below everything British so they never win where there is a choice.
+  else if (n.includes('david')) s += 55
+  else if (n.includes('guy')) s += 50
+  else if (/\b(mark|christopher|eric|roger|steffan|brandon|ryan|george|thomas)\b/.test(n)) s += 45
 
   // Higher-quality variants of whatever matched above.
   if (n.includes('premium')) s += 30
   else if (n.includes('enhanced')) s += 20
 
-  // American now leads, to match the character. en-GB stays well above the
-  // other English locales so a British machine still lands somewhere good.
-  if (/en[-_]us/i.test(v.lang)) s += 25
-  else if (/en[-_]gb/i.test(v.lang)) s += 18
+  if (/en[-_]gb/i.test(v.lang)) s += 25
   else if (/^en/i.test(v.lang)) s += 5
 
-  // Voices that clearly are not the character.
+  // Voices that clearly aren't a butler.
   if (/grandma|grandpa|bubbles|jester|bells|boing|whisper|zarvox|superstar|trinoids|wobble|bahh|organ|cellos|bad news|good news/.test(n)) {
     s -= 200
   }
@@ -317,17 +314,12 @@ function outputContext(): AudioContext | null {
 // ---------------------------------------------------------------------------
 
 /**
- * Clean the text up before it reaches a synthesiser.
+ * Nudge the delivery toward JARVIS's cadence.
  *
  * speechSynthesis ignores SSML, so punctuation is the only prosody control
- * available — the engine pauses on commas and full stops.
- *
- * This used to also guarantee a comma before the vocative "sir", which was
- * most of the old characterisation. There is no honorific now. A name is
- * possible (JARVIS_NAME on the bridge) but it is never sentence-final by
- * design, so it needs no comma bought for it. The rule is gone rather than
- * ported: with nothing left to match legitimately it could only fire on a
- * sentence that happened to end in that word, and splice a comma into it.
+ * available — the engine pauses on commas and full stops. Making sure the
+ * vocative "sir" is always set off by a comma buys the small beat before it
+ * that does most of the characterisation.
  */
 function shape(text: string): string {
   return (
@@ -342,6 +334,10 @@ function shape(text: string): string {
       .replace(/https?:\/\/[^\s]*[^\s.,;:!?)\]]/g, '')
       .replace(/[*_`#>]+/g, '')
       .replace(/^\s*[-•]\s+/gm, '')
+      // The vocative wants its comma — that small beat before "sir" does most
+      // of the characterisation. Anchored to a following pause or end of line
+      // so the honorific is left alone: "Sir Isaac Newton" is not a vocative.
+      .replace(/([^,\s])\s+(sir)(\s*[.,!?;:]|\s*$)/gi, '$1, $2$3')
       .replace(/\s+/g, ' ')
       .trim()
   )
@@ -372,8 +368,8 @@ export function createSpeaker(): Speaker {
 
   const enqueue = (sentence: string, priority = false) => {
     if (cancelled) return
-    // Shape once here so both engines get the same text, stripped of the
-    // markdown a model leaks however firmly it was told not to.
+    // Shape once here so both engines get the same text — stripped markdown,
+    // and the comma before "sir" that buys the beat.
     const text = shape(sentence)
     if (!text) return
 
@@ -496,21 +492,14 @@ export function createSpeaker(): Speaker {
       const voice = pickVoice()
       if (voice) u.voice = voice
       u.lang = voice?.lang ?? 'en-GB'
-      // Deliberate, and deliberately invariant — the character's pace does
-      // not change with stakes, and that steadiness is most of the effect.
-      // A shade slower than it was: the delivery leaves room
-      // around a sentence. Around 125 wpm.
-      u.rate = 0.88
-      // Chest-weighted, which the previous character explicitly was not.
-      // The old note here warned that going lower reads as a film-trailer
-      // voiceover — true, and here that is nearer right than wrong.
-      // 0.70 by ear, on request. This note used to claim 0.78 was the floor
-      // before formants smear and consonants start dropping out — written
-      // from reading rather than listening, and wrong on this machine.
-      // Microsoft David carries 0.70. It does soften plosives, so if words
-      // start arriving mushy rather than deep, this line is the cause and
-      // not the voice.
-      u.pitch = 0.7
+      // Deliberate, and deliberately invariant — the character's pace does not
+      // change with stakes, and that steadiness is most of the effect. This
+      // lands around 130 wpm, below the median for film dialogue.
+      u.rate = 0.92
+      // Mid-baritone, and *not* pushed lower for gravitas. The voice is
+      // clarity-weighted rather than chest-weighted; dropping it further reads
+      // as a film-trailer voiceover, which is the wrong character entirely.
+      u.pitch = 0.95
 
       // speechSynthesis exposes no amplitude, so drive the reactor from a
       // synthetic envelope. It only has to look like speech, not match it.
