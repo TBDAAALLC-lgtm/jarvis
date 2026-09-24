@@ -16,6 +16,7 @@ const wire = (value) => {
   return Buffer.concat([header, body])
 }
 const reply = { result: { content: [{ type: 'text', text: 'Synthetic browser reply' }] } }
+const notification = { method: 'notifications/tools/list_changed', params: {} }
 
 function harness({ onConnect, onWrite } = {}) {
   const writes = []
@@ -76,6 +77,72 @@ test('new-tab and close-tab handlers pass their call context', async () => {
   assert.equal(calls[0][2], extra.signal)
   assert.equal(calls[1][2], extra.signal)
 })
+
+for (const delivery of ['separate chunks', 'one chunk']) {
+  test(`a notification before a result preserves the pending action (${delivery})`, async () => {
+    let timerStillPending = false
+    const env = harness({ onWrite: ({ socket, timers, callback }) => {
+      callback()
+      if (delivery === 'one chunk') {
+        socket.emit('data', Buffer.concat([wire(notification), wire(reply)]))
+      } else {
+        socket.emit('data', wire(notification))
+        timerStillPending = [...timers].some((timer) => timer.delay === 45_000)
+        socket.emit('data', wire(reply))
+      }
+    } })
+    const result = await new env.ChromeLink().call('computer', { action: 'left_click' })
+    assert.equal(result.result?.content[0].text, 'Synthetic browser reply')
+    if (delivery === 'separate chunks') assert.equal(timerStillPending, true)
+    assert.equal(env.writes.length, 1)
+    assert.equal(env.connections(), 1)
+    assert.equal(env.timers.size, 0)
+  })
+}
+
+test('a notification does not consume or hide an extension permission error', async () => {
+  const env = harness({ onWrite: ({ socket, callback }) => {
+    callback()
+    socket.emit('data', Buffer.concat([
+      wire(notification), wire({ error: { content: 'Permission denied by user' } }),
+    ]))
+  } })
+  const readPage = env.chromeKit({ allowWrites: false }).specs.find((spec) => spec.name === 'chrome_read_page')
+  const result = await readPage.handler({ tabId: 7 }, {})
+  assert.equal(result.isError, true)
+  assert.equal(result.content[0].text, 'Permission denied by user')
+  assert.equal(env.writes.length, 1)
+  assert.equal(env.connections(), 1)
+  assert.equal(env.timers.size, 0)
+})
+
+test('an unrecognized JSON frame leaves the action waiting for a result', async () => {
+  const env = harness({ onWrite: ({ socket }) => {
+    socket.emit('data', Buffer.concat([wire({ unexpected: true }), wire(reply)]))
+  } })
+  const result = await new env.ChromeLink().call('get_page_text', { tabId: 7 })
+  assert.equal(result.result?.content[0].text, 'Synthetic browser reply')
+  assert.equal(env.writes.length, 1)
+  assert.equal(env.timers.size, 0)
+})
+
+for (const field of ['result', 'error']) {
+  test(`a malformed ${field} after a notification fails without replaying the action`, async () => {
+    const env = harness({ onWrite: ({ socket }) => {
+      const body = Buffer.from(`{"${field}":`)
+      const header = Buffer.alloc(4)
+      header.writeUInt32LE(body.length)
+      socket.emit('data', Buffer.concat([wire(notification), header, body]))
+    } })
+    await assert.rejects(
+      new env.ChromeLink().call('computer', { action: 'left_click' }),
+      /unreadable reply from the browser:.*may have completed/i,
+    )
+    assert.equal(env.writes.length, 1)
+    assert.equal(env.connections(), 1)
+    assert.equal(env.timers.size, 0)
+  })
+}
 
 for (const failure of ['timeout', 'close', 'error', 'write error', 'malformed reply']) {
   test(`does not replay a browser action after a post-send ${failure}`, async () => {
@@ -146,4 +213,95 @@ test('an already interrupted action does not connect', async () => {
   await assert.rejects(new env.ChromeLink().call('computer', { action: 'type' }, abort.signal), /interrupted/i)
   assert.equal(env.connections(), 0)
   assert.equal(env.writes.length, 0)
+})
+
+const tabContext = (tabId) => ({ result: { content: [
+  { type: 'text', text: JSON.stringify({ availableTabs: [{ tabId }] }) },
+] } })
+const missingTab = { error: { content: 'No tab available' } }
+
+for (const [name, args] of [
+  ['chrome_click', { ref: 'ref_1' }],
+  ['chrome_type', { text: 'Synthetic text' }],
+  ['chrome_key', { text: 'Return' }],
+  ['chrome_form_input', { ref: 'ref_1', value: 'Synthetic value' }],
+  ['chrome_navigate', { url: 'http://localhost:5185/' }],
+  ['chrome_read_page', { tabId: 101 }],
+]) {
+  test(`${name} does not retry a missing target on a different tab`, async () => {
+    let contextCalls = 0
+    const env = harness({ onWrite: ({ socket, message }) => {
+      socket.emit('data', wire(message.params.tool === 'tabs_context_mcp'
+        ? tabContext(++contextCalls === 1 && args.tabId === undefined ? 101 : 202)
+        : missingTab))
+    } })
+    const tool = env.chromeKit({ allowWrites: true }).specs.find((spec) => spec.name === name)
+    const result = await tool.handler(args, {})
+    assert.equal(result.isError, true)
+    assert.equal(result.content[0].text, 'No tab available')
+    const actions = env.writes.filter((message) => message.params.tool !== 'tabs_context_mcp')
+    assert.equal(actions.length, 1)
+    assert.equal(actions[0].params.args.tabId, 101)
+    assert.equal(contextCalls, args.tabId === undefined ? 1 : 0)
+  })
+}
+
+for (const [format, content] of [
+  ['creation text', [
+    { type: 'text', text: 'Created new tab. Tab ID: 202' },
+    { type: 'text', text: 'Tab Context:\n- Executed on tabId: 202\n- Available tabs:\n  • tabId 101: "Older tab"\n  • tabId 202: "New Tab"' },
+  ]],
+  ['executed-tab context', [
+    { type: 'text', text: 'Tab Context:\n- Executed on tabId: 202\n- Available tabs:\n  • tabId 101: "Older tab"\n  • tabId 202: "New Tab"' },
+  ]],
+  ['explicit JSON id', [{ type: 'text', text: JSON.stringify({ tabId: 202, availableTabs: [{ tabId: 101 }] }) }]],
+]) {
+  test(`new-tab remembers the created tab for an omitted-tab action (${format})`, async () => {
+    const env = harness({ onWrite: ({ socket, message }) => {
+      const response = message.params.tool === 'tabs_context_mcp' ? tabContext(101)
+        : message.params.tool === 'tabs_create_mcp' ? { result: { content } } : reply
+      socket.emit('data', wire(response))
+    } })
+    const kit = env.chromeKit({ allowWrites: true })
+    const invoke = (name, args = {}) => kit.specs.find((spec) => spec.name === name).handler(args, {})
+    await invoke('chrome_read_page')
+    await invoke('chrome_new_tab')
+    await invoke('chrome_type', { text: 'Synthetic text' })
+    assert.equal(env.writes.at(-1).params.args.tabId, 202)
+    assert.equal(env.writes.filter((message) => message.params.tool === 'tabs_context_mcp').length, 1)
+  })
+}
+
+for (const creation of ['failed', 'missing id']) {
+  test(`new-tab ${creation === 'failed' ? 'preserves the target on failure' : 'clears the old target when no created id is returned'}`, async () => {
+    let contextCalls = 0
+    const env = harness({ onWrite: ({ socket, message }) => {
+      const response = message.params.tool === 'tabs_context_mcp' ? tabContext(++contextCalls === 1 ? 101 : 303)
+        : message.params.tool === 'tabs_create_mcp' && creation === 'failed'
+          ? { error: { content: 'Permission denied by user' } } : reply
+      socket.emit('data', wire(response))
+    } })
+    const kit = env.chromeKit({ allowWrites: true })
+    const invoke = (name) => kit.specs.find((spec) => spec.name === name).handler({}, {})
+    await invoke('chrome_read_page')
+    await invoke('chrome_new_tab')
+    await invoke('chrome_read_page')
+    assert.equal(env.writes.at(-1).params.args.tabId, creation === 'failed' ? 101 : 303)
+    assert.equal(contextCalls, creation === 'failed' ? 1 : 2)
+  })
+}
+
+test('an explicit missing tab does not discard a different remembered target', async () => {
+  const env = harness({ onWrite: ({ socket, message }) => {
+    const response = message.params.tool === 'tabs_context_mcp' ? tabContext(101)
+      : message.params.args.tabId === 202 ? missingTab : reply
+    socket.emit('data', wire(response))
+  } })
+  const readPage = env.chromeKit({ allowWrites: false }).specs.find((spec) => spec.name === 'chrome_read_page')
+  await readPage.handler({}, {})
+  const failed = await readPage.handler({ tabId: 202 }, {})
+  await readPage.handler({}, {})
+  assert.equal(failed.isError, true)
+  assert.equal(env.writes.at(-1).params.args.tabId, 101)
+  assert.equal(env.writes.filter((message) => message.params.tool === 'tabs_context_mcp').length, 1)
 })

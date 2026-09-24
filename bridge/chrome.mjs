@@ -213,11 +213,17 @@ class ChromeLink {
       const body = this.buffer.subarray(4, 4 + length)
       this.buffer = this.buffer.subarray(4 + length)
       const waiter = this.waiting
-      this.waiting = null
       if (!waiter) continue // unsolicited frame; nothing asked for it
       try {
-        waiter.resolve(JSON.parse(body.toString('utf8')))
+        const reply = JSON.parse(body.toString('utf8'))
+        // The native host broadcasts notifications on this same stream. Like
+        // its SocketClient, only a result/error frame completes the request.
+        if (!reply || typeof reply !== 'object' || typeof reply.method === 'string') continue
+        if (!('result' in reply) && !('error' in reply)) continue
+        this.waiting = null
+        waiter.resolve(reply)
       } catch (err) {
+        this.waiting = null
         waiter.reject(new Error(`unreadable reply from the browser: ${err.message}`))
       }
     }
@@ -459,6 +465,24 @@ function readTab(reply) {
   return null
 }
 
+/** Read the created tab's identity, never the first older available tab. */
+function readCreatedTab(content) {
+  if (!Array.isArray(content)) return null
+  let executedOn = null
+  for (const block of content) {
+    if (block?.type !== 'text' || typeof block.text !== 'string') continue
+    try {
+      const tab = JSON.parse(block.text)?.tabId
+      if (Number.isSafeInteger(tab) && tab >= 0) return tab
+    } catch { /* The extension also returns its created-tab ID in prose. */ }
+    const created = /^Created new tab\. Tab ID:\s*(\d+)\b/m.exec(block.text)
+    if (created && Number.isSafeInteger(Number(created[1]))) return Number(created[1])
+    const context = /^\s*-\s*Executed on tabId:\s*(\d+)\b/m.exec(block.text)
+    if (context && Number.isSafeInteger(Number(context[1]))) executedOn = Number(context[1])
+  }
+  return executedOn
+}
+
 /**
  * Wait until the tab is actually showing the page we asked for.
  *
@@ -551,8 +575,8 @@ function browserSession() {
    * user is looking at it — "the tab" is not ambiguous to anybody except the
    * protocol.
    *
-   * Cleared whenever the extension says the tab is gone, so a tab the user
-   * closed by hand costs one retry rather than an unusable browser.
+   * Cleared when the extension says this tab is gone. The failed action is
+   * returned to the caller so it can recover without acting on a different tab.
    */
   let activeTab = null
 
@@ -616,14 +640,11 @@ function browserSession() {
         const tab = await resolveTab(sent.tabId)
         sent = tab === null ? sent : { ...sent, tabId: tab }
       }
-      let reply = await link.call(name, sent, signal)
-      // The tab we remembered has gone — the user closed it, or Chrome was
-      // restarted under us. Forget it and try once with a fresh one before
-      // reporting a browser that is actually working fine.
+      const reply = await link.call(name, sent, signal)
+      // A ref, focused field or explicit tab belongs to this target. Never
+      // replay its action on another tab just because this one disappeared.
       if (needsTab && reply?.error && /no tab available/i.test(JSON.stringify(reply.error))) {
-        activeTab = null
-        const tab = await resolveTab(undefined)
-        if (tab !== null) reply = await link.call(name, { ...(args ?? {}), tabId: tab }, signal)
+        if (sent.tabId === activeTab) activeTab = null
       }
       return toResult(reply)
     } catch (err) {
@@ -649,7 +670,11 @@ function browserSession() {
     forward,
     settle,
     resolveTab,
-    /** A fresh tab was opened, so stop steering the old one. */
+    /** Remember a successful creation, clearing the old target if no ID came back. */
+    rememberCreatedTab: (content) => {
+      activeTab = readCreatedTab(content)
+    },
+    /** The current tab was closed, so stop steering it. */
     forgetTab: () => {
       activeTab = null
     },
@@ -718,7 +743,7 @@ be clicked. Use chrome_page_text instead when you only want the prose.`
 export function chromeKit({ allowWrites }) {
   // This connection's own browser session. Built here, with the kit, so it
   // lives exactly as long as the socket that is using it.
-  const { forward, settle, resolveTab, forgetTab, isActiveTab } = browserSession()
+  const { forward, settle, resolveTab, rememberCreatedTab, forgetTab, isActiveTab } = browserSession()
 
   const tools = [
     tool(
@@ -953,7 +978,7 @@ export function chromeKit({ allowWrites }) {
         async (args, extra) => {
           const out = await forward('tabs_create_mcp', { needsTab: false })(args, extra)
           // Whatever was just opened is what the next action should land in.
-          forgetTab()
+          if (!out.isError) rememberCreatedTab(out.content)
           return out
         },
       ),
