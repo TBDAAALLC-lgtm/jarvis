@@ -17,8 +17,32 @@ import { BACKEND, BRIDGE_HTTP_URL, env } from '../config'
  * is not a path worth encouraging, so direct mode is treated as browser-only.
  */
 
+/**
+ * Which account a brain is signed in as.
+ *
+ * Only the Claude side has one, and it exists because "is it signed in" was
+ * never the question that actually went wrong here. A login to the right
+ * organisation and a login to a personal account carrying the same
+ * subscription are indistinguishable from outside — same tile, same "ready",
+ * same word "team" — and they diverge several turns later as an error that
+ * reads like anything except a wrong account.
+ *
+ * Optional because a bridge that has not been restarted since this was added
+ * does not send it, and an unlabelled tile is the right thing to show then
+ * rather than a guess.
+ */
+export type Account = {
+  email: string | null
+  org: string | null
+  orgId: string | null
+}
+
 /** Whether one brain can answer, and a short reason when it cannot. */
-export type ProviderState = { ready: boolean; detail: string }
+export type ProviderState = {
+  ready: boolean
+  detail: string
+  account?: Account | null
+}
 
 export type ProviderName = 'claude' | 'gpt'
 
@@ -90,12 +114,25 @@ export async function probeCapabilities(): Promise<Capabilities> {
       const h = (await res.json()) as {
         stt?: boolean
         tts?: boolean
-        providers?: Partial<Record<ProviderName, Partial<ProviderState>>>
+        providers?: Partial<
+          Record<ProviderName, Partial<ProviderState> & { account?: Partial<Account> | null }>
+        >
       }
-      const one = (name: ProviderName): ProviderState => ({
-        ready: Boolean(h.providers?.[name]?.ready),
-        detail: h.providers?.[name]?.detail ?? 'unknown',
-      })
+      const one = (name: ProviderName): ProviderState => {
+        // Taken only when it carries something. An account object of three
+        // nulls is the same as no account, and the tooltip should not grow a
+        // trailing separator for it.
+        const a = h.providers?.[name]?.account
+        const account =
+          a && (a.email || a.org)
+            ? { email: a.email ?? null, org: a.org ?? null, orgId: a.orgId ?? null }
+            : null
+        return {
+          ready: Boolean(h.providers?.[name]?.ready),
+          detail: h.providers?.[name]?.detail ?? 'unknown',
+          account,
+        }
+      }
       current = {
         stt: Boolean(h.stt),
         tts: Boolean(h.tts),

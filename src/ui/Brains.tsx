@@ -26,6 +26,35 @@ const LABEL: Record<Provider, string> = {
   gpt: 'JARVIS-GPT',
 }
 
+/**
+ * The tooltip: the verdict, the remedy, and whose account this is.
+ *
+ * The account goes here and not on the tile, for two reasons.
+ *
+ * The tile is a 9px row of dot, name and verdict, and an email address is
+ * longer than all three together — it would wrap the tile or truncate to
+ * something unreadable, and it would sit there permanently. It is also the
+ * user's address, on screen for the whole session, in every screenshot and
+ * every shared window. There is no version of "always visible" that is worth
+ * that.
+ *
+ * And the question it answers is not one anybody asks continuously. "Which
+ * account is this?" gets asked exactly when something looks wrong — which is
+ * the moment you point at the tile anyway. So the answer lives under the
+ * pointer: free when you do not want it, immediate when you do.
+ *
+ * Organisation before email, because organisation is the thing that was
+ * actually wrong. A personal account and an organisation account with the same
+ * subscription differ in that word alone.
+ */
+function hoverLabel(label: string, state: ProviderState): string {
+  const parts = [`${label} — ${state.detail}`]
+  const a = state.account
+  if (a?.org) parts.push(a.org)
+  if (a?.email) parts.push(a.email)
+  return parts.join(' · ')
+}
+
 /** Roomy enough to read at 9px, short enough not to wrap the tile. */
 function shortDetail(state: ProviderState): string {
   if (state.ready) return 'READY'
@@ -98,9 +127,11 @@ export function Brains() {
               s.ready ? '' : ' brain-down'
             }`}
             aria-pressed={selected}
-            // The full sentence from the bridge, including the command to run.
-            // The face of the tile has room for a verdict, not a remedy.
-            title={`${LABEL[name]} — ${s.detail}`}
+            // The full sentence from the bridge, including the command to run,
+            // and which account it is signed in as. The face of the tile has
+            // room for a verdict, not a remedy — see hoverLabel for why the
+            // account belongs here rather than on it.
+            title={hoverLabel(LABEL[name], s)}
             onClick={(e) => {
               setProvider(name)
               // Space and Enter both activate a focused button, and Space is
