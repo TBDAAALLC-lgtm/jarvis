@@ -267,11 +267,11 @@ const norm = (s: string) =>
  * would be the single most infuriating failure this file could have.
  *
  * "no" used to be on this list and was the reason he interrupted himself.
- * Everything here is granted two exemptions at once — isEcho waves it through
- * as definitely-not-playback, and the guard check then skips both the
- * self-guard clock and the two-word rule — so a word on this list fires a
- * barge-in instantly, from a single syllable, with no defence left. That is
- * correct for "stop", which is a button. It is ruinous for "no", which is the
+ * Everything here is granted two exemptions at once — isEcho will not convict
+ * it of being playback on the strength of that word, and the guard check then
+ * skips both the self-guard clock and the two-word rule — so a word on this
+ * list fires a barge-in instantly, from a single syllable, with no defence
+ * left. That is correct for "stop", which is a button. It is ruinous for "no", which is the
  * most common word in his own speech: every "no record of it" and "there is
  * no" leaked into the microphone, cleared both gates, and cut him off
  * mid-sentence. Membership here is not "words that mean stop" — it is "words
@@ -280,6 +280,11 @@ const norm = (s: string) =>
  */
 const OVERRIDE =
   /\b(stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it)\b/i
+
+/** Which overrides a line actually contains, normalised so the two sides of a
+ *  comparison are the same shape. Multi-word entries survive `norm` intact. */
+const OVERRIDE_ALL = new RegExp(OVERRIDE.source, 'gi')
+const overridesIn = (text: string): string[] => norm(text).match(OVERRIDE_ALL) ?? []
 
 /**
  * Words too common to be evidence of anything.
@@ -308,35 +313,52 @@ const STOP = new Set(
  */
 function isEcho(heard: string, spoken: string): boolean {
   if (!spoken) return false
+
+  const all = norm(heard).split(' ').filter(Boolean)
+  if (!all.length) return true
+
   /**
-   * An override word is only evidence when HE did not just say it.
+   * An override word is only evidence when HE did not just say THAT word.
    *
    * This exemption exists so "stop" is never suppressed for colliding with his
    * speech, and that is right. But taken unconditionally it inverts: the more
    * ordinary the word, the more often his own playback contains it, and the
    * exemption then certifies his voice as the user's — after which the guard
    * check skips its remaining defences because the same word is on the same
-   * list. Two independent gates, defeated by one token, and the second can
-   * never help because the first has already cleared it.
+   * list. Two independent gates, defeated by one token.
    *
-   * Hearing "stop" while he is saying "stop" is the one case worth being wrong
-   * about, so the word is still honoured; what it no longer does is prove the
-   * audio came from the room when it demonstrably matches his own output.
+   * The comparison is word against word, not list against list. Asking only
+   * whether playback held *some* override is what turned a real interruption —
+   * "Jarvis, open the report" over "Wait, I can open the report now" — into an
+   * echo, on the strength of a word he never said.
    */
-  if (OVERRIDE.test(heard) && !OVERRIDE.test(spoken)) return false
-
-  const all = norm(heard).split(' ').filter(Boolean)
-  if (!all.length) return true
+  const heardOverrides = overridesIn(heard)
+  const spokenOverrides = new Set(overridesIn(spoken))
+  if (heardOverrides.some((w) => !spokenOverrides.has(w))) return false
 
   const mine = new Set(norm(spoken).split(' '))
-  const content = all.filter((w) => !STOP.has(w))
+
+  /**
+   * What is left once the overrides he is also saying are set aside. Those
+   * prove nothing either way, so the rest of the utterance has to carry the
+   * verdict alone — and when nothing is left to weigh, the benefit of the doubt
+   * goes to the room. Hearing "stop now" while he says "I can stop now" is the
+   * one case worth being wrong about, and it must not be dropped because the
+   * single ordinary word left over happens to appear in his sentence too.
+   */
+  const rest = heardOverrides.length
+    ? norm(heard).replace(OVERRIDE_ALL, ' ').split(' ').filter(Boolean)
+    : all
+  if (!rest.length) return false
+
+  const content = rest.filter((w) => !STOP.has(w))
 
   // Nothing distinctive was said at all, so there is no strong evidence either
   // way. Demand a total match before discarding it — the cost of dropping a
   // real question is much higher than the cost of one stray echo getting in.
   if (content.length < 2) {
-    if (all.length < 2) return false
-    return all.every((w) => mine.has(w))
+    if (rest.length < 2) return false
+    return rest.every((w) => mine.has(w))
   }
 
   let hits = 0
