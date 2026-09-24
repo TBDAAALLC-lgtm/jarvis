@@ -16,6 +16,7 @@
     "lint": "oxlint",
     "test": "node --test",
     "test:coverage": "node --test --experimental-test-coverage",
+    "fixture:chrome": "node scripts/chrome-fixture.mjs",
     "preview": "vite preview",
     "bridge": "node bridge/server.mjs",
     "bridge:writes": "node bridge/server.mjs --writes",
