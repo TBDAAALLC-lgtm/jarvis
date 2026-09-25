@@ -30,6 +30,7 @@ import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
 import { renderPage } from './page.mjs'
 import { openaiKey } from './openai.mjs'
 import { forgetImages, runTurn, trim } from './gpt.mjs'
+import { createGoogleSpeech } from './google-speech.mjs'
 
 const PORT = Number(process.env.JARVIS_BRIDGE_PORT ?? 8787)
 
@@ -867,6 +868,22 @@ function corsFor(req) {
 
 // One HTTP server for both the speech proxy and the WebSocket upgrade.
 const http = await import('node:http')
+const googleSpeech = createGoogleSpeech()
+const STT_PROVIDER = process.env.JARVIS_STT_PROVIDER ?? 'auto'
+if (STT_PROVIDER === 'google') await googleSpeech.probe()
+
+function speechStatus() {
+  if (STT_PROVIDER === 'google') return googleSpeech.status()
+  if (!['auto', 'elevenlabs', 'browser'].includes(STT_PROVIDER)) {
+    return { ready: false, provider: 'unavailable', detail: 'Invalid JARVIS_STT_PROVIDER.' }
+  }
+  const ready = STT_PROVIDER !== 'browser' && Boolean(elevenKey())
+  return {
+    ready,
+    provider: ready ? 'elevenlabs' : 'browser',
+    detail: ready ? 'ElevenLabs transcription configured' : 'Browser speech recognition',
+  }
+}
 
 // The response closes when the client leaves. IncomingMessage's close event
 // also fires after a normal upload, so it cannot cancel the provider request.
@@ -901,11 +918,10 @@ const handleRequest = async (req, res) => {
 
   if (req.method === 'GET' && req.url === '/health') {
     // The browser reads this once at boot to decide which voice engine to use.
-    // Both premium paths ride the same ElevenLabs key, so both flags track it:
-    // with a key the app transcribes with Scribe and speaks with ElevenLabs;
-    // without one it falls back to the browser's own recogniser and voice, so a
-    // student with nothing configured still has a working assistant.
+    // Input and output providers are independent. A Google recognition request
+    // never requires an ElevenLabs voice or exposes Google credentials here.
     const eleven = Boolean(elevenKey())
+    const speech = speechStatus()
     const anthropic = claudeAuth()
     const gptKey = Boolean(openaiKey())
     res.writeHead(200, { ...cors, 'content-type': 'application/json' })
@@ -913,7 +929,9 @@ const handleRequest = async (req, res) => {
       JSON.stringify({
         ok: true,
         tts: eleven,
-        stt: eleven,
+        stt: speech.ready,
+        sttProvider: speech.provider,
+        sttDetail: speech.detail,
         // Per-brain readiness, so the two tiles in the corner can each
         // show their own state instead of the app inferring it from
         // silence — which is exactly what nobody could do before.
@@ -1143,35 +1161,51 @@ const handleRequest = async (req, res) => {
 
   // Speech to text. The browser captures one spoken segment as a compressed
   // audio blob and posts the raw bytes here; the bridge hands them to
-  // ElevenLabs Scribe and returns the transcript. This is what replaced the
+  // the selected speech provider and returns the transcript. This replaces the
   // browser's own SpeechRecognition — that API dies silently under always-on
-  // use, and a server-side transcriber cannot. Detecting that the user is
+  // use. Detecting that the user is
   // speaking at all is done locally with voice-activity detection, which never
   // touches this endpoint; this is only for the words.
   if (req.method === 'POST' && req.url === '/stt') {
+    let speech = speechStatus()
+    // A failed credential refresh must not permanently disable the route.
+    // Recheck credentials on the next recording; never resubmit failed audio.
+    if (speech.provider === 'google' && !speech.ready && googleSpeech.configured) {
+      speech = await googleSpeech.probe()
+    }
     const key = elevenKey()
-    if (!key) {
+    if (!speech.ready) {
       res.writeHead(503, cors)
-      return res.end('no elevenlabs key')
+      return res.end(speech.detail)
     }
 
     const type = req.headers['content-type'] || 'audio/webm'
+    if (!/^audio\/(?:webm|ogg|mp4|mpeg|wav|x-wav)(?:;|$)/i.test(type)) {
+      res.writeHead(415, cors)
+      return res.end('unsupported audio format')
+    }
     const chunks = []
     let size = 0
     let overflowed = false
-    // A few seconds of Opus is well under a megabyte; 25 MB is a generous
-    // ceiling that still refuses a runaway stream before it eats the heap.
-    for await (const chunk of req) {
-      chunks.push(chunk)
-      size += chunk.length
-      if (size > 25 * 1024 * 1024) {
-        overflowed = true
-        break
+    const limit = speech.provider === 'google' ? 10 * 1024 * 1024 : 25 * 1024 * 1024
+    try {
+      for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+        chunks.push(chunk)
+        size += chunk.length
+        if (size > limit) {
+          overflowed = true
+          break
+        }
       }
+    } catch {
+      if (req.aborted || res.destroyed) return
+      res.writeHead(400, cors)
+      return res.end('audio upload failed')
     }
     if (overflowed) {
-      req.destroy()
-      res.writeHead(413, cors)
+      // Keep the socket alive long enough to deliver the rejection, then close
+      // it instead of accepting the remainder of an oversized recording.
+      res.writeHead(413, { ...cors, connection: 'close' })
       return res.end('audio too large')
     }
     // Silence, or a click. Nothing to transcribe, and calling out to the API
@@ -1183,6 +1217,14 @@ const handleRequest = async (req, res) => {
 
     const upstreamRequest = speechUpstream(res)
     try {
+      if (speech.provider === 'google') {
+        const result = await googleSpeech.recognize(Buffer.concat(chunks), {
+          signal: upstreamRequest.signal,
+        })
+        if (res.destroyed) return
+        res.writeHead(200, { ...cors, 'content-type': 'application/json' })
+        return res.end(JSON.stringify(result))
+      }
       // The filename extension is the only hint Scribe gets about the codec, so
       // derive it from the content-type the MediaRecorder reported rather than
       // hard-coding one.
@@ -1213,11 +1255,13 @@ const handleRequest = async (req, res) => {
       }
       const data = await upstream.json()
       res.writeHead(200, { ...cors, 'content-type': 'application/json' })
-      return res.end(JSON.stringify({ text: (data.text ?? '').trim() }))
+      return res.end(JSON.stringify({ text: (data.text ?? '').trim(), provider: 'elevenlabs' }))
     } catch (err) {
       if (res.destroyed) return
       if (res.headersSent) return res.destroy()
-      res.writeHead(upstreamRequest.signal.aborted ? 504 : 502, cors)
+      const status = speech.provider === 'google' && Number.isInteger(err?.status)
+        && err.status >= 400 && err.status <= 599 ? err.status : 502
+      res.writeHead(upstreamRequest.signal.aborted ? 504 : status, cors)
       return res.end(upstreamRequest.signal.aborted ? 'speech upstream timed out' : String(err?.message ?? err))
     } finally {
       upstreamRequest.cleanup()
@@ -1267,7 +1311,7 @@ server.listen(PORT, '127.0.0.1')
 
 console.log(`[jarvis] bridge listening on ws://localhost:${PORT}`)
 console.log(
-  `[jarvis] speech ${elevenKey() ? 'via ElevenLabs (key from MCP config)' : 'using browser fallback voice'}`,
+  `[jarvis] recognition ${speechStatus().provider}: ${speechStatus().detail}`,
 )
 console.log(`[jarvis] model ${MODEL} · effort ${EFFORT}`)
 console.log(

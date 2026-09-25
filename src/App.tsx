@@ -65,10 +65,25 @@ const newId = () =>
  *  that woke him as "travis" gets that word sent on to the model as a question. */
 const NAME =
   '(?:jarvis|jarvys|jervis|jarvis\'s|travis|jarviss|java\'s|jarv)'
-/** A bare vocative — "Jarvis", "hey jarvis" — with nothing asked. */
-const BARE_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}[\\s,.!?]*$`, 'i')
+/**
+ * A bare vocative — "Jarvis", "hey jarvis", "Hey, Jarvis!" — with nothing asked.
+ *
+ * The punctuation class between the greeting and the name is not a nicety. A
+ * transcriber writes "Hey, Jarvis!" about as often as "hey jarvis", and with
+ * only `\s*` there the comma failed the match, so the most natural possible way
+ * of saying his name was forwarded to the model as a question — where the only
+ * sensible reading of the lone word "Jarvis" is a request to introduce himself.
+ * That is the whole of why he kept doing it.
+ */
+const BARE_NAME = new RegExp(
+  `^[\\s,.:;!?-]*(?:hey|hi|ok|okay|yo)?[\\s,.:;!?-]*${NAME}[\\s,.!?]*$`,
+  'i',
+)
 /** A leading vocative on a real command: "Jarvis, what's the weather". */
-const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-]*`, 'i')
+const LEADING_NAME = new RegExp(
+  `^[\\s,.:;!?-]*(?:hey|hi|ok|okay|yo)?[\\s,.:;!?-]*${NAME}\\b[\\s,.:!?-]*`,
+  'i',
+)
 
 export default function App() {
   const store = useStore
@@ -84,6 +99,23 @@ export default function App() {
    */
   const turn = useRef(0)
   const booting = useRef(false)
+  /**
+   * Whether he has already announced himself on this page.
+   *
+   * He introduced himself on every single wake, which is the behaviour of a
+   * kiosk rather than of someone you are talking to: the second "Hey Jarvis" in
+   * a conversation is not a greeting, it is you getting his attention again, and
+   * answering it with the same line means waiting out an introduction you have
+   * already heard before you can say what you wanted. Once per page, then.
+   *
+   * A ref rather than store state on purpose. It has to survive every rerender
+   * and everything that stands him down — going dormant, switching provider,
+   * the bridge dropping and reconnecting — because none of those is a new
+   * acquaintance. Reloading the page is, and that is the one thing that clears
+   * it, which is also exactly the gesture someone makes when they want the
+   * introduction back.
+   */
+  const greeted = useRef(false)
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePoll = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -142,6 +174,11 @@ export default function App() {
     s.pushTurn({ id: newId(), role: 'user', text: said })
     s.setPhase('thinking')
 
+    // Whatever was still being said belonged to the turn this one replaces —
+    // most often the greeting, when someone says his name and their request
+    // half a second apart. Two speakers with their own queues will happily talk
+    // over each other, and nothing downstream can separate them again.
+    silence()
     const spk = createSpeaker()
     speaker.current = spk
     sfx.duck(true)
@@ -262,17 +299,34 @@ export default function App() {
     sfx.play('wake')
 
     // "Jarvis, what's happening in AI this week" in one breath. Waiting for a
-    // greeting he didn't need is the most common way an assistant wastes time.
+    // greeting he didn't need is the most common way an assistant wastes time —
+    // and a first wake that already carries its command has spent the
+    // introduction just as surely as one that heard it, so it counts.
     if (trailing) {
+      greeted.current = true
       void respond(trailing)
       return
     }
 
+    // Every wake after the first is him being called, not met. Straight to
+    // listening, with only the wake tone to say the microphone is open: that
+    // sound carries the same information as the sentence and costs none of the
+    // two seconds the user is waiting to talk through.
+    if (greeted.current) {
+      silence()
+      listen(AWAIT_SPEECH_MS)
+      return
+    }
+
+    greeted.current = true
     store.getState().setPhase('waking')
 
-    // Answer to his name. Deliberately NOT awaited any more: the microphone is
+    // Answer to his name, once. Deliberately NOT awaited: the microphone is
     // already open and the echo filter knows his voice, so the user can talk
-    // straight over the greeting instead of waiting it out.
+    // straight over the greeting instead of waiting it out. Anything already
+    // queued is cut first, so two wakes in quick succession cannot leave two
+    // speakers talking over each other.
+    silence()
     const greeting = createSpeaker()
     speaker.current = greeting
     greeting.say(attention())

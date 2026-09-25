@@ -46,6 +46,7 @@ type Speaker = {
 // ---------------------------------------------------------------------------
 
 let speaking = ''
+let speakingOwner: symbol | null = null
 let recent = ''
 let recentUntil = 0
 
@@ -104,24 +105,55 @@ if (typeof window !== 'undefined') {
 let nativeBroken = false
 
 let speakingAt = 0
+let playbackOwner: symbol | null = null
 
-/** When the current sentence started, or 0 if nothing is being spoken. The
- *  voice loop uses this to refuse to interrupt him in his own first syllable. */
+/**
+ * When sound actually started coming out of the speakers, or 0 when nothing is
+ * playing.
+ *
+ * Deliberately not the moment a sentence was queued. It used to be, and that
+ * made the number a lie in exactly the situation it exists for: the voice loop
+ * reads this both to refuse to interrupt him in his own first syllable and to
+ * tell "he is audibly talking" from "he is thinking". A cloud sentence spends a
+ * few hundred milliseconds being synthesised and fetched before it makes any
+ * sound at all, so the old clock spent the self-guard on silence, and a policy
+ * written in terms of playback would have refused the user while the room was
+ * in fact quiet.
+ *
+ * `speakingNow()` is the other half of the pair and is deliberately *not* gated
+ * this way — the echo text has to be available as soon as it is known.
+ */
 export function speakingSince(): number {
-  return speaking ? speakingAt : 0
+  return speakingAt
 }
 
-function setSpeaking(text: string) {
+/** An engine reported real audio: SpeechSynthesisUtterance.onstart, or an
+ *  audio element's `playing`. */
+function playbackStarted(owner: symbol) {
+  playbackOwner = owner
+  speakingAt = Date.now()
+}
+
+/** ...and it has stopped — ended, errored, or cut off by a barge-in. */
+function playbackStopped(owner: symbol) {
+  if (playbackOwner !== owner) return
+  playbackOwner = null
+  speakingAt = 0
+}
+
+function setSpeaking(text: string, owner: symbol) {
   if (text) {
     speaking = text
-    speakingAt = Date.now()
+    speakingOwner = owner
     return
   }
+  if (speakingOwner !== owner) return
   if (speaking) {
     recent = speaking
     recentUntil = Date.now() + ECHO_TAIL_MS
   }
   speaking = ''
+  speakingOwner = null
 }
 
 /**
@@ -350,6 +382,9 @@ type Item = {
 }
 
 export function createSpeaker(): Speaker {
+  // Cancel/end events from a replaced speaker can arrive after its replacement
+  // starts. Only the owner may clear that playback clock or its echo reference.
+  const owner = Symbol('speaker')
   const queue: Item[] = []
   let buffer = ''
   let cancelled = false
@@ -439,7 +474,7 @@ export function createSpeaker(): Speaker {
 
   async function speakOne(item: Item): Promise<void> {
     if (cancelled) return
-    setSpeaking(item.text)
+    setSpeaking(item.text, owner)
     try {
       const url = item.audio ? await item.audio : null
       if (cancelled) return
@@ -469,7 +504,7 @@ export function createSpeaker(): Speaker {
         await playUrl(rescue, item.text)
       }
     } finally {
-      if (speaking === item.text) setSpeaking('')
+      setSpeaking('', owner)
     }
   }
 
@@ -524,6 +559,7 @@ export function createSpeaker(): Speaker {
         if (done) return
         done = true
         nativeInFlight = false
+        playbackStopped(owner)
         if (watchdog) clearTimeout(watchdog)
         if (keepalive) clearInterval(keepalive)
         cancelAnimationFrame(raf)
@@ -535,7 +571,11 @@ export function createSpeaker(): Speaker {
       }
 
       u.onstart = () => {
+        if (done || cancelled) return
         started = true
+        // The first moment there is genuinely sound in the room. The self-guard
+        // window starts here, not when the sentence was handed to the engine.
+        playbackStarted(owner)
         diag.started++
         diag.lastError = ''
         if (watchdog) clearTimeout(watchdog)
@@ -638,6 +678,7 @@ export function createSpeaker(): Speaker {
       const finish = () => {
         if (done) return
         done = true
+        playbackStopped(owner)
         cancelAnimationFrame(raf)
         outLevel = 0.12
         URL.revokeObjectURL(url)
@@ -648,6 +689,10 @@ export function createSpeaker(): Speaker {
       // SpeechSynthesisUtterance.onstart, and it is what makes the diagnostics
       // verdict — and the T self-test — tell the truth on the premium path.
       audio.onplaying = () => {
+        if (done || cancelled) return
+        // ...and the moment the generated path becomes audible, which is a good
+        // deal later than the moment its sentence was queued.
+        playbackStarted(owner)
         diag.started++
         diag.lastError = ''
       }
@@ -727,7 +772,12 @@ export function createSpeaker(): Speaker {
       queue.length = 0
       // Keep the echo tail: the words already in the air still have to be
       // recognised and discarded, even though he has stopped adding to them.
-      setSpeaking('')
+      // The playback clock, though, stops here and not a moment later — nothing
+      // is coming out of the speakers from now on. The engine callbacks below
+      // clear it too; this is the case where neither ever fires, because the
+      // sentence was cancelled before it made a sound.
+      setSpeaking('', owner)
+      playbackStopped(owner)
 
       // Only reach for the global cancel if this speaker actually has a native
       // utterance out — speechSynthesis.cancel() is document-wide and would

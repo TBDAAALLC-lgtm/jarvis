@@ -3,15 +3,11 @@ import { BACKEND, BRIDGE_HTTP_URL, env } from '../config'
 /**
  * What speech engines are actually available, decided once at boot.
  *
- * The whole point is that the app runs for anyone. A student who has done
- * nothing but install Claude Code and log in gets the browser's own speech
- * recognition and voice — no keys, no accounts, it just works. A student who
- * also has an ElevenLabs key (in their Claude Code config or a .env) gets Scribe
- * transcription and the ElevenLabs voice instead, automatically, with no flag to
- * set. This module is how the rest of the app learns which of those two worlds
- * it is in, so voice.ts and tts.ts never have to guess.
+ * Input and output are independent: Google can recognize speech while the
+ * browser or ElevenLabs speaks. Explicit Google configuration reports setup
+ * failures instead of quietly switching back to browser recognition.
  *
- * The premium paths both live behind the bridge — it holds the key and makes
+ * Cloud speech lives behind the bridge — it holds credentials and makes
  * the calls, so the browser never sees a secret. In direct mode (no bridge)
  * only a key baked into the bundle could reach ElevenLabs for speech, and that
  * is not a path worth encouraging, so direct mode is treated as browser-only.
@@ -47,8 +43,10 @@ export type ProviderState = {
 export type ProviderName = 'claude' | 'gpt'
 
 export type Capabilities = {
-  /** ElevenLabs speech-to-text (Scribe) is reachable via the bridge. */
+  /** The selected server-side speech recognition provider is configured. */
   stt: boolean
+  sttProvider?: 'google' | 'elevenlabs' | 'browser' | 'unavailable'
+  sttDetail?: string
   /** ElevenLabs text-to-speech is reachable via the bridge. */
   tts: boolean
   /**
@@ -113,6 +111,8 @@ export async function probeCapabilities(): Promise<Capabilities> {
     if (res.ok) {
       const h = (await res.json()) as {
         stt?: boolean
+        sttProvider?: Capabilities['sttProvider']
+        sttDetail?: string
         tts?: boolean
         providers?: Partial<
           Record<ProviderName, Partial<ProviderState> & { account?: Partial<Account> | null }>
@@ -135,6 +135,8 @@ export async function probeCapabilities(): Promise<Capabilities> {
       }
       current = {
         stt: Boolean(h.stt),
+        sttProvider: h.sttProvider ?? (h.stt ? 'elevenlabs' : 'browser'),
+        sttDetail: typeof h.sttDetail === 'string' ? h.sttDetail : undefined,
         tts: Boolean(h.tts),
         // An older bridge sends no `providers` block at all. Claiming both
         // are dead would be wrong, so fall back to the pre-tile world:
@@ -158,6 +160,10 @@ export async function probeCapabilities(): Promise<Capabilities> {
 /** A short human label for the HUD: what voice stack is actually in play. */
 export function engineLabel(): string {
   const c = current
+  if (c.sttProvider === 'google') {
+    if (!c.stt) return 'Google Speech-to-Text · setup required'
+    return c.tts ? 'Google recognition · ElevenLabs voice' : 'Google recognition · browser voice'
+  }
   if (c.stt && c.tts) return 'ElevenLabs'
   if (c.tts) return 'ElevenLabs voice'
   // env.elevenKey is only meaningful in direct mode; harmless to mention.

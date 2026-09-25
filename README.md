@@ -116,12 +116,12 @@ prints its choice, e.g. `[jarvis] model claude-opus-5 · effort medium`.
 
 The loop is designed so that nothing silently dies and barge-in feels natural.
 
-- **Detection is local.** An energy-based voice-activity detector
-  (`src/lib/vad.ts`) decides when you are speaking. It is instant, cannot quietly
-  fail, and is what makes **barge-in** work — speak while JARVIS is talking and he
-  stops.
-- **Transcription has two tiers, chosen automatically at boot.** The browser asks
-  the bridge `/health` and picks the best available:
+- **Detection is local.** A voice-activity detector (`src/lib/vad.ts`) captures
+  speech segments. While JARVIS speaks, an addressed wake phrase or standalone
+  stop command interrupts him; background sound alone does not.
+- **Transcription is selected at boot.** The browser asks the bridge `/health`:
+  - **`JARVIS_STT_PROVIDER=google`** → Google Speech-to-Text V2 Chirp 3, via `/stt`.
+    Vocabulary hints cover Jarvis, ChatGPT, Claude, GitHub and Google Drive.
   - **ElevenLabs key present** → ElevenLabs Scribe, via the bridge `/stt` endpoint.
   - **Nothing configured** → the browser's own `SpeechRecognition` (Chrome/Edge),
     guarded by a heartbeat so it recovers when Chrome throttles it.
@@ -130,10 +130,12 @@ The loop is designed so that nothing silently dies and barge-in feels natural.
   the browser voice, and if the OS voice itself is broken it latches over to the
   cloud voice.
 
-So it works with no keys and auto-upgrades when a key appears — there is no flag
-to set. Capability detection lives in `src/lib/capabilities.ts`, which probes the
-bridge's `GET /health` (returning `{ ok, tts, stt }`, both tracking the
-ElevenLabs key) once at boot and picks the engines.
+The default `auto` mode preserves browser/ElevenLabs selection. Explicit Google
+mode reports configuration errors instead of silently using another recognizer.
+Input and output are independent, so Google recognition works with the browser
+voice. `/health` reports `sttProvider` and `sttDetail` alongside `tts` and `stt`.
+Credentials being available does not prove API access; the detail distinguishes
+that from a completed recognition request.
 
 ---
 
@@ -233,6 +235,10 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 | `JARVIS_FILE_ROOTS` | — | Roots the `/file` endpoint may serve from |
 | `JARVIS_VOICE_ID` | — | ElevenLabs voice id |
 | `ELEVENLABS_API_KEY` | — | Optional; enables the ElevenLabs voice + Scribe |
+| `JARVIS_STT_PROVIDER` | `auto` | `auto`, `google`, `elevenlabs`, or `browser` |
+| `JARVIS_GOOGLE_PROJECT` | `GOOGLE_CLOUD_PROJECT` | Explicit Google project ID or number |
+| `JARVIS_GOOGLE_LOCATION` | `us` | Chirp 3 region: `us` or `eu` |
+| `JARVIS_GOOGLE_LANGUAGE` | `en-US` | Recognition language code |
 
 ### Frontend (`.env.local`)
 
@@ -244,6 +250,39 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 | `VITE_KOKORO_VOICE` | Voice for the Kokoro engine |
 | `VITE_USE_ELEVENLABS` | Force the ElevenLabs voice on |
 | `VITE_ANTHROPIC_API_KEY` | Direct mode only |
+
+### Google Speech-to-Text
+
+Use an active Google Cloud project with billing and the Speech-to-Text API
+enabled, and an account allowed to recognize speech and consume that project's
+services. Configure [Application Default Credentials](https://cloud.google.com/docs/authentication/provide-credentials-adc)
+for that account. A `gcloud auth login` session alone is not ADC.
+
+In PowerShell, after selecting the intended project:
+
+```powershell
+gcloud auth application-default login
+gcloud auth application-default set-quota-project YOUR_PROJECT_ID
+$env:JARVIS_STT_PROVIDER = 'google'
+$env:JARVIS_GOOGLE_PROJECT = 'YOUR_PROJECT_ID'
+$env:JARVIS_GOOGLE_LOCATION = 'us'
+$env:JARVIS_GOOGLE_LANGUAGE = 'en-US'
+npm start
+```
+
+Restart the bridge and reload the page after setup changes. These variables
+belong to the bridge's shell, not Vite's `.env.local`. Google credentials remain
+server-side; microphone segments are sent to Google for transcription. Google
+recognition does not change JARVIS's speaking voice.
+
+The recognizer uses [Chirp 3 vocabulary hints](https://cloud.google.com/speech-to-text/docs/models/chirp-3).
+An additional narrow correction maps a complete navigation command such as
+`open up chat tee tee tee` to `open up ChatGPT`. It preserves the original as
+`rawText` in the `/stt` response and leaves negated commands, dictation, quotes
+and qualified instructions unchanged. It does not invent an action from
+uncertain speech. Recordings are limited to 10 MiB; local voice detection sends
+short segments. Provider errors are visible and do not trigger automatic paid
+retries or a switch to another transcription service.
 
 ### Adding an ElevenLabs key
 

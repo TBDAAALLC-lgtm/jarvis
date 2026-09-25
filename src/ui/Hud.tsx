@@ -7,6 +7,7 @@ import { Effects } from './Effects'
 import { Pointer } from './Pointer'
 import { GestureGuide } from './GestureGuide'
 import { Brains } from './Brains'
+import { caps } from '../lib/capabilities'
 
 const statusText: Record<Phase, string> = {
   offline: 'OFFLINE',
@@ -345,6 +346,11 @@ export function Hud() {
       <footer className="hud-bottom">
         <span className="hint">
           say <b>“hey jarvis”</b> · <kbd>Space</kbd> to talk · <kbd>G</kbd> hands
+          {caps().sttProvider === 'google' && (
+            <span title={caps().sttDetail}>
+              {' · '}hearing: {caps().stt ? 'Google' : 'Google setup required'}
+            </span>
+          )}
           {voice && (
             <>
               {' · '}

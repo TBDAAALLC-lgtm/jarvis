@@ -29,7 +29,9 @@ export type VoiceMode =
   | 'wake'
   /** He is expecting you to speak. Everything is a command. */
   | 'command'
-  /** He is thinking or talking. Anything you say is an interruption. */
+  /** He is thinking or talking. Speech into the silence of thinking is a new
+   *  request; speech over an answer he is audibly giving has to be addressed to
+   *  him before it counts as one. */
   | 'guard'
   /** Something is playing that must not be transcribed at all. */
   | 'deaf'
@@ -77,8 +79,50 @@ const WAKE_DEBOUNCE = 1500
  * used to be silently discarded, so the wake word "just didn't work" with no
  * indication why. Better a rare false wake than a name that does not answer.
  */
-const WAKE =
-  /\b(?:hey|hi|ok|okay|yo)?\s*(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv)\b(?!'s)/i
+const NAME = "(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv)"
+const GREETING = '(?:hey|hi|ok|okay|yo)?'
+const WAKE = new RegExp(`\\b${GREETING}\\s*${NAME}\\b(?!'s)`, 'i')
+
+/**
+ * The same phrase, but at the head of the utterance — the shape of actually
+ * addressing him rather than merely mentioning him.
+ *
+ * Anywhere-in-the-line is right for waking a dormant assistant, where his name
+ * is the only thing being listened for. It is wrong as a licence to cut off an
+ * answer, because the microphone is open to the whole room during one: a name
+ * in the middle of a sentence spoken to somebody else is not an instruction,
+ * and treating it as one is the same mistake as treating "please wait for
+ * delivery" as a stop button. The punctuation class is what lets "Hey, Jarvis!"
+ * through — a transcriber puts a comma after the greeting about half the time.
+ */
+const ADDRESSED = new RegExp(
+  `^[\\s,.:;!?-]*${GREETING}[\\s,.:;!?-]*${NAME}\\b(?!'s)`,
+  'i',
+)
+
+/**
+ * The stop button, spoken.
+ *
+ * Anchored end to end, and that is the entire point of it. These words all
+ * occur inside ordinary sentences — "we have enough time", "please wait for
+ * delivery", "hold on to the receipt" — and an unanchored match on any of them
+ * is indistinguishable from someone in the room finishing a different
+ * conversation. A stop is a short, complete, unambiguous utterance; when it is
+ * the whole of what was said there is nothing else it could have meant.
+ */
+const STOP_PHRASE =
+  /^[\s,.!?-]*(?:please\s+)?(?:stop(?:\s+(?:now|it|that|please|talking))?|cancel(?:\s+that)?|be\s+quiet|quiet|enough|hold\s+on|shut\s+up|never\s?mind|forget\s+it)[\s.,!?]*$/i
+
+/**
+ * Is this someone deliberately taking the floor from him?
+ *
+ * The only question that matters while he is audibly speaking. Everything else
+ * the room produces — background talk, a half-formed hypothesis the recogniser
+ * is about to revise, his own voice coming back through the microphone — has to
+ * leave the answer running.
+ */
+const isDeliberate = (text: string): boolean =>
+  ADDRESSED.test(text) || STOP_PHRASE.test(text)
 
 /** Everything after the wake phrase, which is usually the actual command. */
 function afterWake(text: string): string {
@@ -129,7 +173,7 @@ const CONTINUES =
 const TRAILS = /[,;:–—-]$/
 
 /**
- * A barge-in this soon after he starts a sentence is him, not you.
+ * Speech this soon after a sentence becomes audible is him, not you.
  *
  * Echo cancellation and the raised guard threshold stop most of his playback
  * reaching the detector, but the attack of the very first syllable is the
@@ -137,8 +181,16 @@ const TRAILS = /[,;:–—-]$/
  * canceller has adapted to it. Without this, a long answer could interrupt
  * itself on its own first word, which reads as JARVIS refusing to speak.
  *
- * Kept short deliberately. This is the one window where a genuine interruption
- * is also least likely: the user has not yet heard enough to want to stop him.
+ * It is no longer the thing standing between playback and a cancellation — that
+ * is now `isDeliberate`, which is a stronger test and does not expire. What the
+ * window still does is attribute: a rejected fragment inside it is almost
+ * certainly his own attack rather than a person, and `selfGuarded` says so,
+ * which is the difference between reading the diagnostics and guessing at them.
+ * A deliberate address is never held by it — the user who wants him to stop
+ * within 350ms of the first syllable wants it most of all.
+ *
+ * Measured from real audio onset, not from the moment a sentence was queued;
+ * see `speakingSince` in tts.ts for why that distinction cost a whole window.
  */
 const SELF_GUARD_MS = 350
 
@@ -267,16 +319,21 @@ const norm = (s: string) =>
  * would be the single most infuriating failure this file could have.
  *
  * "no" used to be on this list and was the reason he interrupted himself.
- * Everything here is granted two exemptions at once — isEcho will not convict
- * it of being playback on the strength of that word, and the guard check then
- * skips both the self-guard clock and the two-word rule — so a word on this
- * list fires a barge-in instantly, from a single syllable, with no defence
- * left. That is correct for "stop", which is a button. It is ruinous for "no", which is the
- * most common word in his own speech: every "no record of it" and "there is
- * no" leaked into the microphone, cleared both gates, and cut him off
- * mid-sentence. Membership here is not "words that mean stop" — it is "words
- * worth losing a sentence to". "no" is not one; cancel, quiet and enough carry
- * the same intent without appearing in every other answer.
+ * Membership buys one exemption: isEcho will not convict a line of being
+ * playback on the strength of a word he did not himself just say. That is
+ * correct for "stop", which is a button. It was ruinous for "no", which is the
+ * most common word in his own speech — every "no record of it" and "there is
+ * no" leaked into the microphone and cleared the gate. Membership here is not
+ * "words that mean stop" — it is "words worth losing a sentence to". "no" is
+ * not one; cancel, quiet and enough carry the same intent without appearing in
+ * every other answer.
+ *
+ * What it is emphatically *not* is permission to cancel an answer. Being on
+ * this list once did that too, and one list doing both jobs is what let "please
+ * wait for delivery" — an ordinary sentence, spoken to someone else, containing
+ * one of these words in the middle of it — stop him dead. Taking the floor is
+ * `isDeliberate`, which asks about the whole utterance rather than about one
+ * token inside it.
  */
 const OVERRIDE =
   /\b(stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it)\b/i
@@ -381,7 +438,7 @@ function isEcho(heard: string, spoken: string): boolean {
  * apart in one glance.
  */
 export const diag = {
-  /** Which input engine is running: 'elevenlabs' (VAD+Scribe) or 'browser'. */
+  /** Which recognition provider is selected. */
   engine: 'browser',
   /** Whether the microphone pipeline is live. */
   running: false,
@@ -389,6 +446,7 @@ export const diag = {
   sessions: 0,
   /** The most recent transcript, whatever the mode. */
   heard: '',
+  rawHeard: '',
   heardAt: 0,
   /** Last failure — a transcription error, or a capture error. */
   lastError: '',
@@ -425,17 +483,22 @@ if (typeof window !== 'undefined') {
 /**
  * Pick the voice engine and start it.
  *
- * Two engines, chosen by what the bridge reported at boot (see capabilities.ts):
- *   - ElevenLabs available -> local voice-activity detection for instant
- *     barge-in, and ElevenLabs Scribe for the words. The reliable path.
- *   - nothing configured -> the browser's own SpeechRecognition, so a student
- *     with no keys still has a working assistant. Less robust, but free and
- *     zero-setup, and guarded by a heartbeat so its silent death is recovered.
+ * Google and ElevenLabs use local segment capture with server transcription.
+ * Browser recognition is the default when no cloud provider is selected.
+ * An explicitly selected but unavailable provider reports its setup error.
  *
  * The microphone is opened once here so a denied permission is reported loudly
  * rather than surfacing later as an unexplained deafness, whichever engine runs.
  */
 export async function startVoice(h: VoiceHandlers): Promise<Voice> {
+  const capabilities = caps()
+  diag.engine = capabilities.sttProvider ?? (capabilities.stt ? 'elevenlabs' : 'browser')
+  if (!capabilities.stt && ['google', 'unavailable'].includes(diag.engine)) {
+    diag.running = false
+    diag.lastError = capabilities.sttDetail || 'Speech recognition needs configuration. Check the bridge setup.'
+    h.onError(diag.lastError)
+    return { stop: () => {}, live: () => false }
+  }
   try {
     await getMic()
   } catch (err) {
@@ -447,14 +510,39 @@ export async function startVoice(h: VoiceHandlers): Promise<Voice> {
     )
     return { stop: () => {}, live: () => false }
   }
-  diag.engine = caps().stt ? 'elevenlabs' : 'browser'
-  return caps().stt ? startElevenVoice(h) : startBrowserVoice(h)
+  return capabilities.stt ? startCloudVoice(h) : startBrowserVoice(h)
 }
 
-/** VAD + ElevenLabs Scribe. */
-async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
+/** Local segment capture + the bridge's selected transcription provider. */
+async function startCloudVoice(h: VoiceHandlers): Promise<Voice> {
   let lastWake = 0
   let vad: Vad | null = null
+  let stopped = false
+  const controller = new AbortController()
+  const provider = diag.engine === 'google' ? 'Google' : 'ElevenLabs'
+
+  /**
+   * A captured segment, carried with the state of the room it was captured in.
+   *
+   * Transcription is not instant, and he does not stand still while it runs: by
+   * the time Scribe answers, the sentence he was speaking when the microphone
+   * heard something may be two sentences back. Deciding an echo against
+   * whatever he happens to be saying *now* therefore compares a transcript with
+   * the wrong audio, and the reference it needed has already scrolled away —
+   * which is how a perfect recording of his own voice came back as a fresh
+   * command addressed to him. So each segment carries its own reference.
+   */
+  type Segment = {
+    blob: Blob
+    /** What he was audibly saying while this was being recorded. */
+    playback: string
+    /** Whether any of it was recorded over real playback. */
+    overSpeech: boolean
+  }
+
+  /** The candidate being recorded right now, from onset to end of segment. */
+  let candidatePlayback = ''
+  let candidateOverSpeech = false
 
   /**
    * Segments waiting for the transcriber, oldest first.
@@ -469,7 +557,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
    * Order is preserved because the drain is single-flight, which matters —
    * "London" arriving before "what's the weather in" is worse than either.
    */
-  const pendingAudio: Blob[] = []
+  const pendingAudio: Segment[] = []
   let draining = false
 
   /**
@@ -494,26 +582,43 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
    * transcript arriving — and the transcript belongs to the mode the user is in
    * now, not the one they interrupted.
    */
-  const transcribe = async (blob: Blob) => {
+  const transcribe = async (seg: Segment) => {
     const mode = h.mode()
-    if (mode === 'deaf') return
+    if (stopped || mode === 'deaf') return
+    const stale = () => stopped || h.mode() === 'deaf' || (mode !== 'wake' && h.mode() === 'wake')
     const t0 = performance.now()
     try {
       const res = await fetch(`${BRIDGE_HTTP_URL}/stt`, {
         method: 'POST',
-        headers: { 'content-type': blob.type || 'audio/webm' },
-        body: blob,
+        headers: { 'content-type': seg.blob.type || 'audio/webm' },
+        body: seg.blob,
+        signal: controller.signal,
       })
-      diag.idleMs = Math.round(performance.now() - t0)
-      if (!res.ok) {
-        diag.restarts++
-        diag.lastError = `stt ${res.status}`
-        drop(`transcription failed (${res.status})`)
+      // Words that arrive after the loop was torn down, or after something
+      // muted it, belong to a conversation that no longer exists. Acting on
+      // them opens a turn nobody asked for, in a page that may have moved on
+      // entirely — the network round trip is exactly long enough for that.
+      if (stale()) {
+        drop('the segment outlived the session it was spoken in')
         return
       }
-      const { text } = (await res.json()) as { text?: string }
-      const said = (text ?? '').trim()
+      diag.idleMs = Math.round(performance.now() - t0)
+      if (!res.ok) {
+        // Google errors are sanitized by the bridge. Other upstream responses
+        // stay out of the interface because they may carry account details.
+        const detail = provider === 'Google' ? (await res.text()).slice(0, 400).trim() : ''
+        if (stale()) return
+        diag.restarts++
+        diag.lastError = detail || `${provider} transcription failed (${res.status}). Check the speech service and try again.`
+        drop(`transcription failed (${res.status})`)
+        h.onError(diag.lastError)
+        return
+      }
+      const { text, rawText } = (await res.json()) as { text?: string; rawText?: string }
+      if (stale()) return
+      const said = typeof text === 'string' ? text.trim() : ''
       diag.lastError = ''
+      diag.rawHeard = typeof rawText === 'string' && rawText.trim() !== said ? rawText.trim() : ''
 
       if (!said) {
         drop('nothing intelligible in the segment')
@@ -521,9 +626,18 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       }
 
       // His own voice, come back through the microphone. The raised guard
-      // threshold stops most of it at the door; this catches the rest.
-      if (isEcho(said, speakingNow())) {
+      // threshold stops most of it at the door; this catches the rest. Compared
+      // against what he was saying when this audio was captured, not what he is
+      // saying now — see Segment.
+      if (isEcho(said, seg.playback)) {
         drop('echo of his own voice')
+        return
+      }
+
+      // A queued recording keeps the policy of the room it was captured in,
+      // even if the answer finished while Google was transcribing it.
+      if (seg.overSpeech && !isDeliberate(said)) {
+        drop('background speech captured during playback')
         return
       }
 
@@ -543,13 +657,34 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
         return
       }
 
+      /**
+       * The barge-in, decided on words rather than on loudness.
+       *
+       * This used to fire at the energy onset, before anything had been
+       * transcribed — which meant the answer was already dead by the time we
+       * learned the segment was empty, or noise, or him. Cancelling is not
+       * reversible: you cannot un-interrupt an assistant, and every false one
+       * costs the user the sentence they were listening to. So the segment now
+       * has to say something, and while he is audibly speaking it has to say
+       * something addressed to him.
+       *
+       * The cost is honest: a segment has to end before Scribe can transcribe
+       * it, so this engine confirms an interruption rather than reacting to it.
+       * That is a property of doing recognition over the network, not a setting.
+       */
+      if (h.mode() === 'guard') {
+        h.onSpeechStart()
+      }
+
       // Not a turn yet — a piece of one. The assembler decides when the thought
       // is finished, reading the words and whether the room is still noisy.
       assemble.feed(said, vad?.meter().speaking ?? false)
-    } catch (err) {
+    } catch {
+      if (stale()) return
       diag.restarts++
-      diag.lastError = String(err)
+      diag.lastError = `${provider} transcription could not be completed. Check the bridge and connection, then try again.`
       drop('could not reach the speech service')
+      h.onError(diag.lastError)
     }
   }
 
@@ -575,20 +710,36 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       // Standing down mid-thought throws the thought away with it. Otherwise
       // held text would surface as the opening of the *next* conversation.
       if (mode === 'wake') assemble.cancel()
-      // The barge-in. In guard mode the user has started talking over him, and
-      // because the guard threshold is high this is a real interruption rather
-      // than leaked playback — so cut him off now, do not wait for the words.
-      if (mode === 'guard') {
-        const since = speakingSince()
-        if (since && Date.now() - since < SELF_GUARD_MS) {
-          diag.selfGuarded++
-          return
-        }
-        h.onSpeechStart()
-      }
+      /**
+       * Energy is a fact about the room, not about who is in it.
+       *
+       * This is where the answer used to be cancelled — on loudness alone, a
+       * whole segment before anyone knew whether a word had been said. A door,
+       * a chair, a cough and his own first syllable all pass the same gate, and
+       * every one of them killed the sentence outright; by the time the
+       * transcript came back empty there was nothing left to restore. So the
+       * onset only opens a candidate now, and takes down the one thing that
+       * will not survive the wait: what he is saying while it records.
+       */
+      candidatePlayback = speakingNow()
+      candidateOverSpeech = speakingSince() > 0
     },
     onEnd: (blob) => {
-      pendingAudio.push(blob)
+      if (stopped || h.mode() === 'deaf') return
+      // Both ends of the segment, because he may have started or finished a
+      // sentence part way through it and either half could be the echo.
+      const atEnd = speakingNow()
+      const playback =
+        candidatePlayback && atEnd && atEnd !== candidatePlayback
+          ? `${candidatePlayback} ${atEnd}`
+          : candidatePlayback || atEnd
+      pendingAudio.push({
+        blob,
+        playback,
+        overSpeech: candidateOverSpeech || speakingSince() > 0,
+      })
+      candidatePlayback = ''
+      candidateOverSpeech = false
       void drain()
     },
     onLevel: (v) => {
@@ -625,12 +776,15 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
 
   return {
     stop: () => {
+      stopped = true
+      controller.abort()
       clearInterval(guardPoll)
       assemble.cancel()
+      pendingAudio.length = 0
       vad?.stop()
       diag.running = false
     },
-    live: () => vad?.live() ?? false,
+    live: () => !stopped && (vad?.live() ?? false),
   }
 }
 
@@ -773,22 +927,44 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     if (!started || (mode === 'guard' && !barged)) {
       const words = full.split(/\s+/).filter(Boolean).length
       if (mode === 'guard') {
-        // An override word cuts through everything below it — "stop" has to
-        // work on the first syllable or it is not a stop button.
-        if (!OVERRIDE.test(full)) {
-          // His own first syllable, same as the premium path. This engine has
-          // no energy gate, so without the clock the only defence is the word
-          // count below, and a single clear word is exactly what leaks first.
-          const since = speakingSince()
-          if (since && Date.now() - since < SELF_GUARD_MS) {
-            diag.selfGuarded++
+        // A deliberate address or a spoken stop cuts through everything below
+        // it, on the first partial, mid-syllable if that is when it arrives.
+        // "Stop" has to work on the first syllable or it is not a stop button.
+        if (!isDeliberate(full)) {
+          /**
+           * Is there actually sound coming out of the speakers?
+           *
+           * Not "is the machine in guard mode" — guard also covers thinking and
+           * running a tool, where the room is silent and anything said is
+           * plainly meant for him. The distinction is the whole of this branch:
+           * over playback the microphone is hearing him as well as you, so an
+           * unaddressed line is not evidence of anyone wanting the floor, and
+           * an interim hypothesis is not even evidence of what was said. The
+           * recogniser revises "yes please" into a piece of his own sentence
+           * routinely, and the revision arrives after the answer would already
+           * have been cancelled.
+           */
+          if (speakingSince()) {
+            if (Date.now() - speakingSince() < SELF_GUARD_MS) diag.selfGuarded++
+            drop(`heard "${full.slice(-40)}" over his answer — not addressed to him`)
+            /**
+             * And it is not kept, either.
+             *
+             * Rejected fragments used to sit in `settled` with no expiry, so a
+             * word discarded at the start of an answer was still there minutes
+             * later, waiting for one more stray word to push the count over
+             * two. An interruption assembled out of two unrelated syllables
+             * spoken a quiet gap apart is not an interruption; nothing about
+             * the first one survives being rejected.
+             */
+            settled = ''
+            interim = ''
             return
           }
-          // Two words before this engine believes an interruption. The energy
-          // path can be instant because it triggers on loudness the canceller
-          // has already had a pass at; here the evidence is a transcript of
-          // audio that includes his own playback, and one word of that is not
-          // evidence of anything.
+          // Nothing is playing — he is thinking, or a tool is running — so this
+          // is someone talking into a quiet room, and that is a new request.
+          // Still not on one word: a lone token from an open microphone is as
+          // likely to be a cough the recogniser named as it is to be speech.
           if (words < 2) return
         }
       }

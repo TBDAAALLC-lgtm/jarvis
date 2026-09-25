@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { readFileSync } from 'node:fs'
-import { Readable } from 'node:stream'
+import { createServer, request as httpRequest } from 'node:http'
+import { PassThrough, Readable } from 'node:stream'
 import test from 'node:test'
 import vm from 'node:vm'
 
@@ -387,23 +388,32 @@ function requestHandler(fetch, extra = {}) {
     console: { log() {}, error() {}, warn() {} },
     originAllowed: () => true, corsFor: () => ({}),
     elevenKey: () => 'synthetic-test-key', VOICE_ID: 'synthetic', fetch,
+    speechStatus: () => ({ ready: true, provider: 'elevenlabs', detail: 'test credentials' }),
+    googleSpeech: { recognize() { throw new Error('unexpected Google request') } },
+    claudeAuth: () => ({ ok: true, detail: 'synthetic login', account: null }),
+    openaiKey: () => null,
     ...extra,
   })
 }
 
-function request(chunks, path = '/tts') {
+function request(chunks, path = '/tts', headers = {}) {
   const req = Readable.from(chunks)
   req.method = 'POST'
   req.url = path
-  req.headers = {}
+  req.headers = headers
   return req
 }
 
 function response() {
   const res = new EventEmitter()
-  res.writeHead = (status) => { res.statusCode = status; res.headersSent = true }
-  res.write = () => true
-  res.end = () => { res.writableEnded = true; res.emit('finish') }
+  res.body = ''
+  res.writeHead = (status, headers) => { res.statusCode = status; res.headers = headers; res.headersSent = true }
+  res.write = (chunk) => { res.body += String(chunk); return true }
+  res.end = (chunk) => {
+    if (chunk !== undefined) res.body += String(chunk)
+    res.writableEnded = true
+    res.emit('finish')
+  }
   res.destroy = () => { res.destroyed = true; res.emit('close') }
   return res
 }
@@ -475,6 +485,273 @@ test('TTS rejects non-string text before calling the provider', async () => {
     assert.equal(res.statusCode, 400)
   }
   assert.equal(calls, 0)
+})
+
+const googleStatus = { ready: true, provider: 'google', detail: 'Google credentials available; API access not yet verified.' }
+
+function googleHandler(recognize, extra = {}) {
+  return requestHandler(() => { throw new Error('Google selection must not call ElevenLabs') }, {
+    elevenKey: () => null,
+    speechStatus: () => googleStatus,
+    googleSpeech: { recognize },
+    ...extra,
+  })
+}
+
+test('Google STT forwards the complete recording and returns its original and corrected transcript', async () => {
+  const bytes = Buffer.alloc(1500, 7)
+  const expected = { text: 'open up ChatGPT', rawText: 'open up chat tee tee tee', corrected: true, provider: 'google' }
+  let calls = 0
+  const handler = googleHandler(async (audio, options) => {
+    calls++
+    assert.deepEqual(audio, bytes)
+    assert.ok(options.signal instanceof AbortSignal)
+    assert.equal(options.signal.aborted, false)
+    return expected
+  })
+  const res = response()
+  await handler(request([bytes.subarray(0, 600), bytes.subarray(600)], '/stt', { 'content-type': 'audio/webm;codecs=opus' }), res)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.headers['content-type'], 'application/json')
+  assert.deepEqual(JSON.parse(res.body), expected)
+  assert.equal(calls, 1)
+  assert.equal(res.listenerCount('close'), 0)
+})
+
+test('health reports Google recognition independently of the voice provider', async () => {
+  const handler = googleHandler(() => { throw new Error('health cannot submit audio') })
+  const req = request([], '/health')
+  req.method = 'GET'
+  const res = response()
+  await handler(req, res)
+  const health = JSON.parse(res.body)
+  assert.equal(res.statusCode, 200)
+  assert.equal(health.stt, true)
+  assert.equal(health.sttProvider, 'google')
+  assert.equal(health.sttDetail, googleStatus.detail)
+  assert.equal(health.tts, false)
+})
+
+test('unready Google reports its setup problem and never falls back to an available ElevenLabs key', async () => {
+  const unavailable = { ready: false, provider: 'google', detail: 'Configure Application Default Credentials for the selected project.' }
+  const handler = googleHandler(() => { throw new Error('unready Google must not submit audio') }, {
+    elevenKey: () => 'synthetic-available-key',
+    speechStatus: () => unavailable,
+    googleSpeech: {
+      configured: false,
+      probe() { throw new Error('missing project configuration cannot be repaired by a credential probe') },
+      recognize() { throw new Error('unready Google must not submit audio') },
+    },
+  })
+  const res = response()
+  await handler(request([Buffer.alloc(1400)], '/stt'), res)
+  assert.equal(res.statusCode, 503)
+  assert.equal(res.body, unavailable.detail)
+  const req = request([], '/health')
+  req.method = 'GET'
+  const healthRes = response()
+  await handler(req, healthRes)
+  const health = JSON.parse(healthRes.body)
+  assert.equal(health.stt, false)
+  assert.equal(health.sttProvider, 'google')
+  assert.equal(health.sttDetail, unavailable.detail)
+  assert.equal(health.tts, true)
+})
+
+test('a later Google request can recover credentials without restarting or retrying its audio', async () => {
+  let status = { ready: false, provider: 'google', detail: 'Temporary credential lookup failure.' }
+  const calls = []
+  const handler = googleHandler(() => { throw new Error('unexpected default recognizer') }, {
+    speechStatus: () => status,
+    googleSpeech: {
+      configured: true,
+      async probe() {
+        calls.push('probe')
+        status = { ...status, ready: true, detail: 'Credentials available; API unverified.' }
+        return status
+      },
+      async recognize() {
+        calls.push('recognize')
+        return { text: 'open ChatGPT', provider: 'google' }
+      },
+    },
+  })
+  const res = response()
+  await handler(request([Buffer.alloc(1400)], '/stt'), res)
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(JSON.parse(res.body), { text: 'open ChatGPT', provider: 'google' })
+  assert.deepEqual(calls, ['probe', 'recognize'])
+})
+
+test('failed Google credential recovery performs one probe and returns503 without submitting audio', async () => {
+  const status = { ready: false, provider: 'google', detail: 'Google credentials are unavailable.' }
+  let probes = 0
+  const handler = googleHandler(() => { throw new Error('unexpected default recognizer') }, {
+    speechStatus: () => status,
+    googleSpeech: {
+      configured: true,
+      async probe() { probes++; return status },
+      recognize() { throw new Error('failed credential recovery cannot submit audio') },
+    },
+  })
+  const res = response()
+  await handler(request([Buffer.alloc(1400)], '/stt'), res)
+  assert.equal(res.statusCode, 503)
+  assert.equal(res.body, status.detail)
+  assert.equal(probes, 1)
+})
+
+test('Google STT rejects a non-audio upload before invoking the provider', async () => {
+  const handler = googleHandler(() => { throw new Error('unsupported audio cannot reach Google') })
+  const res = response()
+  await handler(request([Buffer.alloc(1400)], '/stt', { 'content-type': 'text/plain' }), res)
+  assert.equal(res.statusCode, 415)
+  assert.equal(res.body, 'unsupported audio format')
+})
+
+test('Google STT ignores empty or click-sized recordings without calling the provider', async () => {
+  const handler = googleHandler(() => { throw new Error('silence cannot reach Google') })
+  for (const length of [0, 1199]) {
+    const res = response()
+    await handler(request([Buffer.alloc(length)], '/stt'), res)
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(JSON.parse(res.body), { text: '' })
+  }
+})
+
+test('Google STT handles a client abort during upload without rejecting its HTTP handler', async () => {
+  const handler = googleHandler(() => { throw new Error('aborted upload cannot reach Google') })
+  const req = new PassThrough()
+  Object.assign(req, { method: 'POST', url: '/stt', headers: { 'content-type': 'audio/webm' } })
+  const res = response()
+  const pending = handler(req, res)
+  req.write(Buffer.alloc(1400))
+  await tick()
+  req.aborted = true
+  res.destroy()
+  req.destroy(Object.assign(new Error('aborted'), { code: 'ECONNRESET' }))
+  await assert.doesNotReject(pending)
+  assert.equal(res.headersSent, undefined)
+  assert.equal(res.body, '')
+})
+
+test('Google STT returns a safe client error when audio upload decoding fails', async () => {
+  const handler = googleHandler(() => { throw new Error('failed upload cannot reach Google') })
+  const req = new PassThrough()
+  Object.assign(req, { method: 'POST', url: '/stt', headers: { 'content-type': 'audio/webm' } })
+  const res = response()
+  const pending = handler(req, res)
+  req.write(Buffer.alloc(1400))
+  await tick()
+  req.destroy(new Error('internal synthetic upload detail'))
+  await assert.doesNotReject(pending)
+  assert.equal(res.statusCode, 400)
+  assert.equal(res.writableEnded, true)
+  assert.ok(res.body.length > 0)
+  assert.ok(!res.body.includes('internal synthetic upload detail'))
+})
+
+test('oversized Google uploads deliver HTTP 413 instead of resetting the client connection', async (t) => {
+  const handler = googleHandler(() => { throw new Error('oversized audio cannot reach Google') })
+  const server = createServer(handler)
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => {
+    server.closeAllConnections()
+    server.close(resolve)
+  }))
+  const result = await new Promise((resolve, reject) => {
+    const req = httpRequest({
+      host: '127.0.0.1', port: server.address().port, path: '/stt', method: 'POST',
+      headers: { 'content-type': 'audio/webm' },
+    }, (res) => {
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (chunk) => { body += chunk })
+      res.on('end', () => resolve({ status: res.statusCode, body }))
+      res.on('error', reject)
+    })
+    req.on('error', reject)
+    req.setTimeout(3000, () => req.destroy(new Error('local upload timed out')))
+    req.end(Buffer.alloc(10 * 1024 * 1024 + 1))
+  })
+  assert.deepEqual(result, { status: 413, body: 'audio too large' })
+})
+
+for (const status of [400, 401, 403, 404, 413, 429, 503]) {
+  test(`Google STT preserves actionable provider HTTP ${status} and its sanitized message`, async () => {
+    const message = `Google speech returned HTTP ${status}. Check the project configuration.`
+    const handler = googleHandler(async () => { throw Object.assign(new Error(message), { status }) })
+    const res = response()
+    await handler(request([Buffer.alloc(1400)], '/stt'), res)
+    assert.equal(res.statusCode, status)
+    assert.equal(res.body, message)
+    assert.equal(res.listenerCount('close'), 0)
+  })
+}
+
+test('Google STT does not turn malformed provider error statuses into successful or invalid HTTP responses', async () => {
+  for (const status of [200, 399, 600, '403']) {
+    const handler = googleHandler(async () => { throw Object.assign(new Error('Google speech request failed.'), { status }) })
+    const res = response()
+    await handler(request([Buffer.alloc(1400)], '/stt'), res)
+    assert.equal(res.statusCode, 502)
+    assert.equal(res.writableEnded, true)
+  }
+})
+
+test('Google STT aborts recognition when the client disconnects', async () => {
+  let signal
+  const handler = googleHandler((_, options) => {
+    signal = options.signal
+    return new Promise((_, reject) => {
+      signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+    })
+  })
+  const res = response()
+  const pending = handler(request([Buffer.alloc(1400)], '/stt'), res)
+  await tick()
+  assert.ok(signal)
+  res.destroy()
+  await pending
+  assert.equal(signal.aborted, true)
+  assert.equal(res.headersSent, undefined)
+  assert.equal(res.listenerCount('close'), 0)
+})
+
+test('Google STT times out stalled recognition and releases its timer', async () => {
+  let expire
+  let cleared = false
+  const handler = googleHandler((_, { signal }) => new Promise((_, reject) => {
+    signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+  }), {
+    setTimeout: (callback, ms) => { assert.equal(ms, 30_000); expire = callback; return 1 },
+    clearTimeout: () => { cleared = true },
+  })
+  const res = response()
+  const pending = handler(request([Buffer.alloc(1400)], '/stt'), res)
+  await tick()
+  assert.equal(typeof expire, 'function')
+  expire()
+  await pending
+  assert.equal(res.statusCode, 504)
+  assert.equal(res.body, 'speech upstream timed out')
+  assert.equal(cleared, true)
+  assert.equal(res.listenerCount('close'), 0)
+})
+
+test('Google STT discards a recognition result that arrives after client disconnect', async () => {
+  let complete
+  const handler = googleHandler(() => new Promise((resolve) => { complete = resolve }))
+  const res = response()
+  const pending = handler(request([Buffer.alloc(1400)], '/stt'), res)
+  await tick()
+  assert.equal(typeof complete, 'function')
+  res.destroy()
+  complete({ text: 'open ChatGPT', provider: 'google' })
+  await pending
+  assert.equal(res.headersSent, undefined)
+  assert.equal(res.body, '')
+  assert.equal(res.listenerCount('close'), 0)
 })
 
 for (const [name, statusCode, type, length, status] of [
