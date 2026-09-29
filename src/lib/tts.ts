@@ -1,3 +1,4 @@
+import { ELEVENLABS_SETTINGS, NATIVE_VOICE, scoreSystemVoice } from '../../shared/voice.mjs'
 import {
   env,
   USE_ELEVENLABS,
@@ -31,7 +32,7 @@ type Speaker = {
   /** Feed streamed text in. Complete sentences are spoken as they appear. */
   push: (delta: string) => void
   /** Speak a phrase ahead of anything still queued. Used for filler like
-   *  "Working on it, sir" while a tool runs. */
+   *  "Checking now" while a tool runs. */
   say: (text: string) => void
   /** No more text coming — flush the remainder and resolve when audio ends. */
   end: () => Promise<void>
@@ -147,7 +148,7 @@ export function speakingNow(): string {
 const SENTENCE_END = /([.!?]["'')\]”’]?\s)|(\n\n)/
 
 /** Full stops that are not sentence ends. Cutting on these puts an audible
- *  gap inside "Mr. Stark" and reads as a stutter. */
+ *  gap inside "Dr. Smith" and reads as a stutter. */
 const ABBREVIATION =
   /(?:^|\s)(mr|mrs|ms|dr|prof|sr|jr|st|vs|etc|e\.g|i\.e|approx|inc|ltd|co|no|vol|fig|dept|est|min|max|hr|hrs|a\.m|p\.m|u\.s|u\.k|no)\.$/i
 
@@ -162,50 +163,8 @@ const MAX_UNSPOKEN = 220
 // Voice selection
 // ---------------------------------------------------------------------------
 
-const VOICE_PREF_KEY = 'jarvis.voice'
-
-/**
- * Rank installed voices by how close they are to the character: a British
- * male, low and level, not a novelty voice.
- *
- * The big win on macOS is the Enhanced/Premium variant of Daniel. The stock
- * "Daniel" is a compact voice from a decade ago and sounds it; the Enhanced
- * download is free (System Settings → Accessibility → Spoken Content → System
- * Voice → Manage Voices) and once installed it appears here automatically.
- */
-function score(v: SpeechSynthesisVoice): number {
-  const n = v.name.toLowerCase()
-  let s = 0
-
-  // The macOS British male, and the closest thing to the character available
-  // without leaving the machine.
-  if (n.startsWith('daniel')) s += 100
-  else if (n.includes('google uk english male')) s += 85
-  else if (/\b(oliver|arthur|jamie|malcolm)\b/.test(n)) s += 80
-  // Newer macOS en-GB male voices — casual, but serviceable.
-  else if (/\b(reed|rocko|eddy)\b/.test(n)) s += 40
-
-  // Higher-quality variants of whatever matched above.
-  if (n.includes('premium')) s += 30
-  else if (n.includes('enhanced')) s += 20
-
-  if (/en[-_]gb/i.test(v.lang)) s += 25
-  else if (/^en/i.test(v.lang)) s += 5
-
-  // Voices that clearly aren't a butler.
-  if (/grandma|grandpa|bubbles|jester|bells|boing|whisper|zarvox|superstar|trinoids|wobble|bahh|organ|cellos|bad news|good news/.test(n)) {
-    s -= 200
-  }
-  // Female-presenting names across the English sets.
-  if (/\b(flo|sandy|shelley|kate|serena|fiona|moira|karen|tessa|samantha|zoe|allison|ava|susan)\b/.test(n)) {
-    s -= 60
-  }
-
-  return s
-}
-
-/** Only voices that scored on a name match, not merely on being English —
- *  otherwise the picker cycles through a dozen US novelty voices. */
+// Separate the new profile's choice from the previous JARVIS voice preference.
+const VOICE_PREF_KEY = 'jarvis.voice.morpheus'
 const USABLE = 40
 
 /** Best-first list of usable voices — also what the voice picker cycles. */
@@ -213,7 +172,7 @@ export function candidateVoices(): SpeechSynthesisVoice[] {
   return speechSynthesis
     .getVoices()
     .filter((v) => /^en/i.test(v.lang))
-    .map((v) => ({ v, s: score(v) }))
+    .map((v) => ({ v, s: scoreSystemVoice(v) }))
     .filter((x) => x.s >= USABLE)
     .sort((a, b) => b.s - a.s)
     .map((x) => x.v)
@@ -246,7 +205,7 @@ function pickVoice(): SpeechSynthesisVoice | null {
 export function currentVoiceName(): string {
   if (USE_ELEVENLABS || caps().tts) return 'ElevenLabs'
   if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
-    return KOKORO_VOICE.replace(/^bm_/, '')
+    return KOKORO_VOICE.replace(/^[ab]m_/, '')
   }
   return pickVoice()?.name ?? 'default'
 }
@@ -299,14 +258,7 @@ function outputContext(): AudioContext | null {
 
 // ---------------------------------------------------------------------------
 
-/**
- * Nudge the delivery toward JARVIS's cadence.
- *
- * speechSynthesis ignores SSML, so punctuation is the only prosody control
- * available — the engine pauses on commas and full stops. Making sure the
- * vocative "sir" is always set off by a comma buys the small beat before it
- * that does most of the characterisation.
- */
+/** Remove visual markup while preserving the model's punctuation and pauses. */
 function shape(text: string): string {
   return (
     text
@@ -320,10 +272,6 @@ function shape(text: string): string {
       .replace(/https?:\/\/[^\s]*[^\s.,;:!?)\]]/g, '')
       .replace(/[*_`#>]+/g, '')
       .replace(/^\s*[-•]\s+/gm, '')
-      // The vocative wants its comma — that small beat before "sir" does most
-      // of the characterisation. Anchored to a following pause or end of line
-      // so the honorific is left alone: "Sir Isaac Newton" is not a vocative.
-      .replace(/([^,\s])\s+(sir)(\s*[.,!?;:]|\s*$)/gi, '$1, $2$3')
       .replace(/\s+/g, ' ')
       .trim()
   )
@@ -354,8 +302,7 @@ export function createSpeaker(): Speaker {
 
   const enqueue = (sentence: string, priority = false) => {
     if (cancelled) return
-    // Shape once here so both engines get the same text — stripped markdown,
-    // and the comma before "sir" that buys the beat.
+    // Shape once so every engine gets the same spoken text.
     const text = shape(sentence)
     if (!text) return
 
@@ -477,15 +424,9 @@ export function createSpeaker(): Speaker {
       const u = new SpeechSynthesisUtterance(text)
       const voice = pickVoice()
       if (voice) u.voice = voice
-      u.lang = voice?.lang ?? 'en-GB'
-      // Deliberate, and deliberately invariant — the character's pace does not
-      // change with stakes, and that steadiness is most of the effect. This
-      // lands around 130 wpm, below the median for film dialogue.
-      u.rate = 0.92
-      // Mid-baritone, and *not* pushed lower for gravitas. The voice is
-      // clarity-weighted rather than chest-weighted; dropping it further reads
-      // as a film-trailer voiceover, which is the wrong character entirely.
-      u.pitch = 0.95
+      u.lang = voice?.lang ?? NATIVE_VOICE.lang
+      u.rate = NATIVE_VOICE.rate
+      u.pitch = NATIVE_VOICE.pitch
 
       // speechSynthesis exposes no amplitude, so drive the reactor from a
       // synthetic envelope. It only has to look like speech, not match it.
@@ -671,7 +612,7 @@ export function createSpeaker(): Speaker {
         if (!m) break
         const cut = m.index + m[0].length
         const candidate = buffer.slice(0, cut)
-        // "Mr. Stark" is not two sentences. Leave the text in the buffer and
+        // "Dr. Smith" is not two sentences. Leave the text in the buffer and
         // wait for a boundary that actually ends something.
         if (ABBREVIATION.test(candidate.trimEnd())) {
           const rest = buffer.slice(cut)
@@ -766,11 +707,7 @@ async function fetchCloudAudio(text: string): Promise<string | null> {
           body: JSON.stringify({
             text,
             model_id: 'eleven_flash_v2_5',
-            voice_settings: {
-              stability: 0.4,
-              similarity_boost: 0.75,
-              speed: 1.05,
-            },
+            voice_settings: ELEVENLABS_SETTINGS,
           }),
         },
       )

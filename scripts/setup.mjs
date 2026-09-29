@@ -25,14 +25,14 @@ console.log('------------------------------------------------------------');
 
 // --- Node version --------------------------------------------------------
 try {
-  const major = Number(process.versions.node.split('.')[0]);
-  if (Number.isFinite(major) && major >= 20) {
-    line(tick, `Node.js ${process.versions.node} (20+ required).`);
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  if ((major === 20 && minor >= 19) || (major === 22 && minor >= 12) || major > 22) {
+    line(tick, `Node.js ${process.versions.node} (20.19+ or 22.12+ required).`);
   } else {
-    line(warn, `Node.js ${process.versions.node} is below 20. Please upgrade — the bridge needs Node 20 or newer.`);
+    line(warn, `Node.js ${process.versions.node} is unsupported. Please use Node 20.19+ or 22.12+ — the frontend requires it.`);
   }
 } catch {
-  line(warn, 'Could not read the Node.js version. JARVIS needs Node 20 or newer.');
+  line(warn, 'Could not read the Node.js version. JARVIS needs Node 20.19+ or 22.12+.');
 }
 
 // --- Claude CLI on PATH ---------------------------------------------------

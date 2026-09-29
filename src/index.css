@@ -337,79 +337,7 @@ kbd {
   font-size: 9px;
 }
 
-/* ----------------------------------------------------------------- panels */
-
-/* Centring is done with flex rather than `transform: translate(-50%)`.
-   Framer Motion's layout projection cannot measure through a transformed
-   ancestor — it re-measures every frame and fights the CSS, which shows up as
-   a hard flicker on any panel that animates. */
-.panels {
-  position: absolute;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 14px;
-  pointer-events: none;
-}
-
-.panels-right {
-  top: 0;
-  bottom: 0;
-  right: 150px;
-  width: 320px;
-  align-items: flex-end;
-}
-
-/* Clear of the SYSTEMS rail, which sits at left:92px and runs ~150px wide. */
-.panels-left {
-  top: 0;
-  bottom: 0;
-  left: 272px;
-  width: 280px;
-  align-items: flex-start;
-}
-
-/* Under the reactor, for images and anything that needs the width. */
-.panels-wide {
-  left: 0;
-  right: 0;
-  bottom: 132px;
-  align-items: center;
-  justify-content: flex-end;
-}
-.panels-wide > * { width: min(620px, 60vw); }
-
-/* Accent identity. The panel re-declares --accent, so every .hud-* class inside
-   picks up the new colour without the model touching a hex value.
-
-   `default` needs a rule of its own even though it just restates the interface
-   cyan. Without one it inherits the live --accent from `.hud` and re-tints
-   itself amber, then violet, then green as the phase moves underneath it —
-   while every explicitly accented panel holds still. A panel is a record of a
-   moment; it should stop changing colour once it has landed. */
-.panel-default { --accent: var(--interface); }
-.panel-amber  { --accent: #ffb547; }
-.panel-violet { --accent: #c77dff; }
-.panel-green  { --accent: #5affc8; }
-.panel-red    { --accent: #ff6b6b; }
-
-.panel {
-  position: relative;
-  width: 100%;
-  /* Bounded so a stray image or a run of markup can't balloon into a
-     screen-height rectangle. */
-  max-height: 46vh;
-  overflow: hidden;
-  padding: 14px 16px;
-  background: linear-gradient(
-    160deg,
-    color-mix(in srgb, var(--accent) 9%, transparent),
-    color-mix(in srgb, var(--accent) 3%, transparent)
-  );
-  backdrop-filter: blur(7px);
-  transform-origin: top center;
-  overflow: hidden;
-}
+/* ----------------------------------------------------------- content chrome */
 
 /* Bracket corners rather than a full border — instrument markings, not boxes. */
 .pk {
@@ -424,41 +352,9 @@ kbd {
 .pk-bl { bottom: 0; left: 0; border-right: 0; border-top: 0; }
 .pk-br { bottom: 0; right: 0; border-left: 0; border-top: 0; }
 
-/* The scan wipe — a thin bright band travelling down the card once as it
-   lands. An earlier version filled the whole panel and washed the content out;
-   the point is a scan line passing over, not a flash. */
-.p-wipe {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 0;
-  height: 34%;
-  transform-origin: top;
-  background: linear-gradient(
-    to bottom,
-    transparent 0%,
-    color-mix(in srgb, var(--accent) 12%, transparent) 70%,
-    color-mix(in srgb, var(--accent) 55%, transparent) 100%
-  );
-  pointer-events: none;
-}
-
-.p-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 10px;
-}
-
-.p-title {
-  font-size: 8px;
-  letter-spacing: 0.3em;
-  opacity: 0.62;
-}
-
 /* The design system JARVIS composes with. These class names live in three
    places and all three have to agree: here, in ALLOWED_CLASSES in
-   src/ui/Panels.tsx — anything absent from that set is stripped before it
+   src/ui/sanitise.ts — anything absent from that set is stripped before it
    reaches the DOM — and in the `display` tool description in
    bridge/panels.mjs, which is how the model learns they exist. */
 
@@ -591,20 +487,15 @@ kbd {
 
    Everything below shows something JARVIS found rather than something he made:
    image-search thumbnails, a clip, a YouTube result. It is loaded through the
-   bridge proxy (see rewriteMedia in src/ui/Panels.tsx), so as far as the page
+   bridge proxy (see rewriteMedia in src/ui/sanitise.ts), so as far as the page
    is concerned it all comes from localhost.
 
-   Two constraints shape the lot of it. The panel is a fixed column with
-   `overflow: hidden`, so anything in here has to be width-driven and never
-   wider than its container — a stray intrinsic width on an image or an iframe
-   would be clipped rather than scrolled, and would take the layout with it. And
-   `.panels` is `pointer-events: none` so the HUD never eats a click, which
-   means anything the user is actually meant to operate has to opt back in. */
+   Media is width-constrained to fit resizable blades. Interactive media opts
+   into pointer events so controls remain usable within the HUD. */
 
 .hud-gallery {
   display: grid;
-  /* auto-fill rather than a fixed count: the same markup has to work in the
-     280px left column and the 620px wide slot under the reactor. */
+  /* Adapt the gallery to the current blade width. */
   grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
   gap: 6px;
   margin: 8px 0 0;
@@ -760,13 +651,6 @@ kbd {
 .hud-hot {
   color: var(--accent);
   text-shadow: 0 0 16px color-mix(in srgb, var(--accent) 60%, transparent);
-}
-
-@media (max-width: 1400px) {
-  .panels-right { right: 40px; width: 290px; }
-  /* Below this width there isn't room for the rail and a left panel side by
-     side, so the panel takes the space and the rail sits under it. */
-  .panels-left { left: 40px; width: 260px; top: 32%; }
 }
 
 /* ------------------------------------------------------------ suggestions */

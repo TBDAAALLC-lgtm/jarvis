@@ -1,3 +1,5 @@
+import { DEFAULT_KOKORO_VOICE, ELEVENLABS_VOICE_ID, KOKORO_VOICES, VOICE_STYLE } from '../shared/voice.mjs'
+
 /**
  * JARVIS configuration.
  *
@@ -74,39 +76,14 @@ export const BACKEND: 'bridge' | 'direct' = choice(
 export const BRIDGE_WS_URL = str(import.meta.env.VITE_BRIDGE_URL) ?? 'ws://localhost:8787'
 export const BRIDGE_HTTP_URL = BRIDGE_WS_URL.replace(/^ws/, 'http')
 
-/**
- * Speech output engine.
- *
- * false (default) — the browser's own speechSynthesis. Runs on-device, so
- *   speech starts on the next frame with no request and no download. This is
- *   the fastest option that exists and it's why it's the default.
- *
- * true — ElevenLabs. Noticeably better voice, but every sentence costs a
- *   round trip plus generation, which is the difference between a conversation
- *   and a walkie-talkie. Turn it on when you want the voice more than the pace.
- */
+/** Capability detection enables cloud speech when available; this flag forces it. */
 export const USE_ELEVENLABS = flag(
   'VITE_USE_ELEVENLABS',
   import.meta.env.VITE_USE_ELEVENLABS,
   false,
 )
 
-/**
- * Speech engine.
- *
- *   'system' — the browser's own speechSynthesis. Starts on the next frame,
- *     costs nothing, but is capped by whatever voices the OS ships; on macOS
- *     the British male option is compact Daniel.
- *
- *   'kokoro' — an 82M-parameter neural TTS running entirely in the browser via
- *     ONNX. Four proper British male voices and far better sound, nothing
- *     leaving the machine. MEASURED ON THIS MACHINE at q8/WebGPU it generates
- *     about 2.2x slower than realtime — "Yes, sir?" took 3.3 seconds and a
- *     thirteen-word sentence took nine. That is not a conversation, so it is
- *     not the default. Try `fp32` (see kokoro.ts) before enabling it; int8
- *     quantisation often silently falls back to CPU on WebGPU, which is the
- *     likely cause.
- */
+/** Browser fallback engine: installed system voice or optional WebGPU Kokoro. */
 export const TTS_ENGINE: 'kokoro' | 'system' = choice(
   'VITE_TTS_ENGINE',
   import.meta.env.VITE_TTS_ENGINE,
@@ -114,26 +91,19 @@ export const TTS_ENGINE: 'kokoro' | 'system' = choice(
   'system',
 )
 
-/**
- * Which Kokoro voice. All four are British male:
- *   bm_george — measured RP baritone, closest to the character
- *   bm_fable  — warmer
- *   bm_lewis  — lower
- *   bm_daniel — brighter
- */
+/** Optional local neural voice; legacy British voices remain valid overrides. */
 export const KOKORO_VOICE = choice(
   'VITE_KOKORO_VOICE',
   import.meta.env.VITE_KOKORO_VOICE,
-  ['bm_george', 'bm_fable', 'bm_lewis', 'bm_daniel'] as const,
-  'bm_george',
+  KOKORO_VOICES,
+  DEFAULT_KOKORO_VOICE,
 )
 
 export const env = {
   anthropicKey: str(import.meta.env.VITE_ANTHROPIC_API_KEY) ?? '',
   elevenKey: str(import.meta.env.VITE_ELEVENLABS_API_KEY) ?? '',
   elevenVoiceId:
-    str(import.meta.env.VITE_ELEVENLABS_VOICE_ID) ?? 'JBFqnCBsd6RMkjVDRZzb',
-  porcupineKey: str(import.meta.env.VITE_PICOVOICE_ACCESS_KEY) ?? '',
+    str(import.meta.env.VITE_ELEVENLABS_VOICE_ID) ?? ELEVENLABS_VOICE_ID,
 }
 
 /** `claude-opus-5` is the strongest model; `claude-sonnet-5` trades a little
@@ -146,18 +116,6 @@ export const MODEL = 'claude-opus-5'
  * For a recorded demo the snappiness is worth it; flip to false to save money.
  */
 export const FAST_MODE = true
-
-/**
- * Wake-word engine.
- *   'speech'    — zero setup, uses the browser's SpeechRecognition to listen for
- *                 "hey jarvis". Chrome/Edge only, audio goes to Google.
- *   'porcupine' — recommended. Runs offline in WASM, "Jarvis" is a built-in
- *                 keyword, far fewer false triggers. Needs a free AccessKey
- *                 from console.picovoice.ai.
- */
-export const WAKE_ENGINE: 'speech' | 'porcupine' = env.porcupineKey
-  ? 'porcupine'
-  : 'speech'
 
 // ---------------------------------------------------------------------------
 // MCP servers
@@ -271,26 +229,8 @@ export const MCP_SERVERS: McpServer[] = [
 
 export const activeServers = () => MCP_SERVERS.filter((s) => s.enabled && s.url)
 
-/**
- * The persona for the browser-direct path only. The bridge carries its own,
- * fuller version in bridge/server.mjs — that's the one that gets used by
- * default, and the one worth editing.
- */
-export const SYSTEM_PROMPT = `You are JARVIS, Tony Stark's assistant. You are speaking out loud.
-
-THE HARD RULE: your entire reply must be under 60 words. This is not a style
-preference — every word is read aloud by a speech synthesiser and the user is
-waiting in silence while it plays. A four-paragraph answer is a failure, however
-good the content. If a question genuinely needs more, give the headline in two
-sentences and offer the detail: "There's more if you want it."
-
-Voice:
-- Dry, precise, quietly amused. Understated competence, never fawning.
-- Say "sir" at most once per exchange, and not in every exchange.
-- Plain spoken prose only. No markdown, no bullet points, no headings, no code,
-  no emoji, no asterisks, no numbered lists.
-- Write numbers, dates and times the way you'd say them: "eight fifteen",
-  "the first of August", not "8:15" or "2026-08-01".
+/** The direct backend uses the shared voice style with its own tool guidance. */
+export const SYSTEM_PROMPT = `${VOICE_STYLE}
 
 Using tools:
 - You have live tools. Use them rather than guessing.

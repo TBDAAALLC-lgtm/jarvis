@@ -1,21 +1,6 @@
-/**
- * Neural speech, entirely in the browser.
- *
- * `speechSynthesis` is limited to whatever voices the operating system ships,
- * and on macOS the British male option is Daniel — a compact concatenative
- * voice from over a decade ago. It is the honest ceiling of the built-in API
- * and it sounds like a satnav.
- *
- * Kokoro is an 82M-parameter TTS model that runs on WebGPU via ONNX. No cloud,
- * no API key, nothing leaves the machine — but it sounds like a person. It
- * carries four British male voices, which is what this project actually wants.
- *
- * The cost is a one-time ~86MB model download, cached by the browser
- * afterwards. It's fetched during the boot sequence so the first "Hey Jarvis"
- * isn't waiting on it, and anything that goes wrong falls back to Daniel.
- */
-
+/** Optional on-device neural speech, with a system-voice fallback. */
 import { KOKORO_VOICE } from '../config'
+import { KOKORO_SPEED } from '../../shared/voice.mjs'
 
 type Kokoro = {
   generate: (
@@ -36,29 +21,6 @@ export const isUnavailable = () => failed
 
 /** Exposed for diagnosis — the console warning alone is easy to miss. */
 export let lastError = ''
-
-/**
- * British male voices, in the order they suit the character. George is the
- * closest to a measured RP baritone; Fable is warmer, Lewis lower, Daniel
- * brighter.
- */
-export const VOICES = ['bm_george', 'bm_fable', 'bm_lewis', 'bm_daniel'] as const
-
-/**
- * A voice id the model doesn't carry throws inside generate(), once per
- * sentence, for the life of the page — and a typo in an env var is the likeliest
- * way to get there. Check it once at module load and fall back audibly in the
- * console instead.
- */
-function resolveVoice(): string {
-  if ((VOICES as readonly string[]).includes(KOKORO_VOICE)) return KOKORO_VOICE
-  console.warn(
-    `[jarvis] VITE_KOKORO_VOICE="${KOKORO_VOICE}" is not one of ${VOICES.join(', ')} — using ${VOICES[0]}.`,
-  )
-  return VOICES[0]
-}
-
-const voice = resolveVoice()
 
 /**
  * Generation failures latch after this many in a row. One is worth retrying —
@@ -115,10 +77,8 @@ export async function speak(text: string): Promise<string | null> {
   if (!tts) return null
   try {
     const audio = await tts.generate(text, {
-      voice,
-      // Slightly under natural pace — the character is never hurried, and the
-      // steadiness is most of the characterisation.
-      speed: 0.95,
+      voice: KOKORO_VOICE,
+      speed: KOKORO_SPEED,
     })
     failures = 0
     return URL.createObjectURL(audio.toBlob())
@@ -138,10 +98,4 @@ export async function speak(text: string): Promise<string | null> {
     }
     return null
   }
-}
-
-/** Voice ids this build of the model actually carries. */
-export async function availableVoices(): Promise<string[]> {
-  const tts = (await load()) as unknown as { voices?: Record<string, unknown> } | null
-  return tts?.voices ? Object.keys(tts.voices) : []
 }
