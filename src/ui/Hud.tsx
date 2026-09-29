@@ -299,11 +299,7 @@ export function Hud() {
         )}
       </AnimatePresence>
 
-      {/* The one surface. Panels used to sit alongside this as a second place
-          for things to appear, which meant two places to look and a decision
-          the model had to make on grounds it could not know. Everything renders
-          here now; Panels.tsx is unmounted rather than deleted so the design
-          system it documents stays findable. */}
+      {/* Both display panels and web content are presented as blades. */}
       <Blades />
 
       {ui.chrome.suggestions && <Suggestions />}

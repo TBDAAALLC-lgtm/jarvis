@@ -1,6 +1,7 @@
 # J.A.R.V.I.S.
 
-A browser voice assistant with an Iron Man holographic interface. Say
+A browser voice assistant with an Iron Man holographic interface and a calm,
+Morpheus-inspired voice. Say
 **"Hey Jarvis"**, he wakes, listens, and does real things through your tools —
 searches the web, generates images, drives your phone, reads your mail. The face
 is a web page (React + Vite + Three.js + custom GLSL). The brain is Claude Code,
@@ -25,7 +26,7 @@ can have — Node.js and Chrome. That's the whole list.
   or the platform installer at <https://docs.claude.com/en/docs/claude-code> —
   then run `claude` once and complete login. The bridge reuses that login. **No
   API key**, and usage is billed to your existing Claude account.
-- **Node.js 20 or newer** — free, one installer from <https://nodejs.org>. This
+- **Node.js 20.19+ or 22.12+** — free, one installer from <https://nodejs.org>. This
   is a Node web app, so it is the one unavoidable tool.
 - **Google Chrome or Microsoft Edge**, in a **real browser window** — not an
   embedded preview pane. Preview panes (including the one inside editors and
@@ -231,7 +232,7 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 | `JARVIS_ALLOWED_ORIGINS` | local dev | Extra WebSocket origins to accept |
 | `JARVIS_ALLOW_NO_ORIGIN` | off | Accept connections with no `Origin` header |
 | `JARVIS_FILE_ROOTS` | — | Roots the `/file` endpoint may serve from |
-| `JARVIS_VOICE_ID` | — | ElevenLabs voice id |
+| `JARVIS_VOICE_ID` | Sawyer | ElevenLabs voice ID override |
 | `ELEVENLABS_API_KEY` | — | Optional; enables the ElevenLabs voice + Scribe |
 
 ### Frontend (`.env.local`)
@@ -241,9 +242,32 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 | `VITE_BACKEND` | `bridge` (default) or `direct` |
 | `VITE_BRIDGE_URL` | Where to reach the bridge |
 | `VITE_TTS_ENGINE` | `system` or `kokoro` |
-| `VITE_KOKORO_VOICE` | Voice for the Kokoro engine |
+| `VITE_KOKORO_VOICE` | Kokoro voice override; default `am_fenrir` |
 | `VITE_USE_ELEVENLABS` | Force the ElevenLabs voice on |
 | `VITE_ANTHROPIC_API_KEY` | Direct mode only |
+
+### Voice and delivery
+
+The default delivery is a Morpheus-inspired mentor: calm, deliberate and
+grounded, with short sentences and no butler phrasing. The app name, wake phrase
+("Hey Jarvis"), interface, tools and interruption controls stay the same.
+
+- **Browser speech:** prefers available American male voices, with a lower pitch
+  and slower rate. Press **V** to audition alternatives. Choices are saved for
+  this profile separately from the old JARVIS voice; sound depends on your OS.
+- **Kokoro:** `am_fenrir` at 0.9 speed. Set `VITE_TTS_ENGINE=kokoro` to enable it.
+  The other supported American choices are `am_michael`, `am_onyx`, `am_adam`;
+  the four previous `bm_*` choices remain valid overrides.
+- **ElevenLabs:** Sawyer — Midnight Storyteller, at 0.9 speed. Set
+  `JARVIS_VOICE_ID` in the bridge shell to use another voice available to your
+  account. Direct mode uses `VITE_ELEVENLABS_VOICE_ID` instead.
+
+The settings and spoken persona live in `shared/voice.mjs`, used by both backends.
+These are stock synthetic voices with an inspired delivery, not a recording or
+clone of the film performance. Press **T** to audition the active engine.
+
+Provider references: [ElevenLabs' replacement voices](https://elevenlabs.io/docs/help-center/product/voices/my-voices/what-are-default-voices)
+and [Kokoro's voice catalog](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md).
 
 ### Adding an ElevenLabs key
 
@@ -297,12 +321,30 @@ terminal, and that nothing else is holding port `8787`.
 
 All of this lives in `bridge/server.mjs`:
 
+- The bridge binds to IPv4 loopback (`127.0.0.1`), keeping it local to this machine.
 - The WebSocket accepts only local dev origins (add more with
   `JARVIS_ALLOWED_ORIGINS`).
 - `/file`, `/img` and `/media` validate the scheme, confine to allowed roots,
   resolve the real path, and refuse private and loopback addresses (SSRF guard).
 - The tool gate (`decideTool`) is default-deny for effectful MCP tools.
 - A strict CSP in `index.html`; model-authored panel HTML is sanitised.
+
+---
+
+## Development checks
+
+```bash
+npm ci
+npm test
+npm run lint
+npm run build
+```
+
+The tests cover system-voice selection, installed Kokoro voice IDs and custom
+bridge URLs in the browser security policy. Vite stages the hand-tracking WASM
+from the installed dependency for both development and production builds.
+An actual microphone, OS voice and configured provider account are needed to
+audition speech quality and test a complete spoken conversation.
 
 ---
 

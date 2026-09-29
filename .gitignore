@@ -23,5 +23,5 @@ dist-ssr
 *.sln
 *.sw?
 
-# Copied out of node_modules by scripts/start.mjs — 34MB of build output.
+# Copied from node_modules by scripts/vendor.mjs during Vite dev/build.
 public/mediapipe/
